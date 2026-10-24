@@ -1,0 +1,109 @@
+name: ${COMPOSE_PROJECT_NAME:-course-knowledge}
+
+services:
+  qdrant:
+    image: 3dcourse-qdrant:1.14.1
+    build:
+      context: ./deploy
+      dockerfile: qdrant.Dockerfile
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    cpus: ${KB_QDRANT_CPUS:-0.5}
+    mem_limit: ${KB_QDRANT_MEMORY:-768m}
+    # Only the Rust service on this private network can reach Qdrant.
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - type: bind
+        source: ${KB_HOST_DATA_DIR:-./data}/qdrant
+        target: /qdrant/storage
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - knowledge-internal
+
+  knowledge-service:
+    image: ${KB_SERVICE_IMAGE:-3dcourse-knowledge-service:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    cpus: ${KB_SERVICE_CPUS:-0.5}
+    mem_limit: ${KB_SERVICE_MEMORY:-768m}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${KB_PORT:-8080}:8080"
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      TOKIO_WORKER_THREADS: "2"
+      KB_BIND_ADDR: 0.0.0.0:8080
+      KB_DEV_DATABASE_URL: ${KB_DEV_DATABASE_URL:-sqlite:///var/lib/knowledge-service/data/dev/knowledge.sqlite?mode=rwc}
+      KB_PROD_DATABASE_URL: ${KB_PROD_DATABASE_URL:-sqlite:///var/lib/knowledge-service/data/prod/knowledge.sqlite?mode=rwc}
+      KB_DATA_DIR: /var/lib/knowledge-service/data
+      KB_CACHE_DIR: /var/lib/knowledge-service/data/cache
+      KB_DOCUMENT_MAX_PAGES: ${KB_DOCUMENT_MAX_PAGES:-200}
+      QDRANT_HTTP_URL: http://qdrant:6333
+      QDRANT_GRPC_URL: http://qdrant:6334
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      ASR_BASE_URL: ${ASR_BASE_URL:-}
+      ASR_MODEL: ${ASR_MODEL:-}
+      ASR_API_KEY: ${ASR_API_KEY:-}
+      AUTH_DEV_UPSTREAM_BASE_URL: ${AUTH_DEV_UPSTREAM_BASE_URL:-https://futuredev.artz.zone/api}
+      AUTH_PROD_UPSTREAM_BASE_URL: ${AUTH_PROD_UPSTREAM_BASE_URL:-https://future.artz.zone/api}
+      AUTH_UPSTREAM_ME_PATH: ${AUTH_UPSTREAM_ME_PATH:-/auth/me}
+      ARK_EMBEDDING_BASE_URL: ${ARK_EMBEDDING_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal}
+      ARK_EMBEDDING_MODEL: ${ARK_EMBEDDING_MODEL:-doubao-embedding-vision-251215}
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      LLM_PROTOCOL: ${LLM_PROTOCOL:-chat}
+      LLM_THINKING: ${LLM_THINKING:-enabled}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-high}
+      LLM_VISION_ENABLED: ${LLM_VISION_ENABLED:-true}
+      KB_MIN_VECTOR_SCORE: ${KB_MIN_VECTOR_SCORE:-0.25}
+      KB_STORAGE_BACKEND: oss
+      KB_DEV_COURSEWARE_HOSTS: ${KB_DEV_COURSEWARE_HOSTS:-futuredev-cdn.artz.zone,futuredev.oss-cn-beijing.aliyuncs.com}
+      KB_PROD_COURSEWARE_HOSTS: ${KB_PROD_COURSEWARE_HOSTS:-future-cdn.artz.zone,futureprod.oss-cn-beijing.aliyuncs.com}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-https://oss-cn-beijing.aliyuncs.com}
+      OSS_REGION: ${OSS_REGION:-cn-beijing}
+      OSS_DEV_BUCKET: ${OSS_DEV_BUCKET:-futuredev}
+      OSS_PROD_BUCKET: ${OSS_PROD_BUCKET:-futureprod}
+      OSS_ACCESS_KEY_ID: ${OSS_ACCESS_KEY_ID:-}
+      OSS_ACCESS_KEY_SECRET: ${OSS_ACCESS_KEY_SECRET:-}
+      ARK_API_KEY: ${ARK_API_KEY:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      KB_MODEL_ALLOWED_HOSTS: ${KB_MODEL_ALLOWED_HOSTS:-ark.cn-beijing.volces.com,cn.bestpudding.xyz,api.deepseek.com}
+      ENCRYPTION_MASTER_KEY: ${ENCRYPTION_MASTER_KEY:-}
+    volumes:
+      - type: bind
+        source: ${KB_HOST_DATA_DIR:-./data}
+        target: /var/lib/knowledge-service/data
+        bind:
+          create_host_path: false
+    networks:
+      - knowledge-internal
+
+networks:
+  knowledge-internal:
+    driver: bridge

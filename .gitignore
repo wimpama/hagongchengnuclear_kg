@@ -1,0 +1,16 @@
+# Local credentials and runtime state
+.env
+.env.*
+!.env.*.example
+data/
+target/
+
+# Local editor and OS files
+.idea/
+.vscode/
+*.log
+Thumbs.db
+__pycache__/
+*.py[cod]
+
+processing/node_modules/

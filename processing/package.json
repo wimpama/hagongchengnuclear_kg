@@ -1,0 +1,13 @@
+{
+  "name": "course-knowledge-document-processing",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": { "test": "node --test pptx.test.mjs" },
+  "dependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "@office-kit/pptx": "0.26.0",
+    "@office-kit/pptx-preview": "0.18.0",
+    "fflate": "0.8.3"
+  }
+}

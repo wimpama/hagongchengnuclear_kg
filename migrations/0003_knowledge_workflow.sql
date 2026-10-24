@@ -1,0 +1,15 @@
+ALTER TABLE kb_assets ADD COLUMN published_revision_id TEXT REFERENCES kb_asset_revisions(revision_id);
+ALTER TABLE kb_asset_revisions ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE kb_asset_revisions ADD COLUMN index_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE kb_asset_revisions ADD COLUMN embedding_config_id TEXT;
+ALTER TABLE kb_asset_revisions ADD COLUMN collection_id TEXT;
+ALTER TABLE kb_asset_revisions ADD COLUMN expected_vector_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE kb_content_parts ADD COLUMN evidence_status TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE kb_messages ADD COLUMN client_message_id TEXT;
+CREATE UNIQUE INDEX idx_kb_message_idempotent ON kb_messages(conversation_id, client_message_id, role);
+CREATE TABLE kb_active_indexes(course_id TEXT PRIMARY KEY, collection_id TEXT NOT NULL REFERENCES kb_vector_collections(collection_id));
+CREATE TABLE kb_media_tickets(ticket TEXT PRIMARY KEY, asset_id TEXT NOT NULL, revision_id TEXT NOT NULL, storage_key TEXT NOT NULL, mime_type TEXT NOT NULL, user_id TEXT, purpose TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE kb_index_outbox(id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES kb_asset_revisions(revision_id), state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error_code TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX idx_kb_outbox_pending ON kb_index_outbox(state, updated_at);
+CREATE TABLE kb_runtime_configs(kind TEXT PRIMARY KEY, config_json TEXT NOT NULL, encrypted_secret BLOB, updated_by TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE kb_request_locks(conversation_id TEXT PRIMARY KEY, acquired_at INTEGER NOT NULL);
