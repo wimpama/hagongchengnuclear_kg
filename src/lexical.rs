@@ -47,27 +47,38 @@ pub async fn index_revision(
     tx: &mut Transaction<'_, Sqlite>,
     revision: &str,
 ) -> Result<(), ApiError> {
-    let rows=sqlx::query("SELECT part_id,content_text,content_sha256 FROM kb_content_parts WHERE revision_id=? AND evidence_status='approved' AND content_text IS NOT NULL")
+    let rows=sqlx::query("SELECT p.part_id,p.content_text,p.content_sha256,a.original_name FROM kb_content_parts p JOIN kb_asset_revisions r USING(revision_id) JOIN kb_assets a USING(asset_id) WHERE p.revision_id=? AND p.evidence_status IN ('approved','visual_only')")
         .bind(revision).fetch_all(&mut **tx).await?;
     for row in rows {
         let part: String = row.get("part_id");
-        let text: String = row.get("content_text");
+        let text: Option<String> = row.get("content_text");
+        let original_name: String = row.get("original_name");
         sqlx::query("DELETE FROM kb_lexical_fts WHERE part_id=?")
             .bind(&part)
             .execute(&mut **tx)
             .await?;
         sqlx::query("INSERT INTO kb_lexical_fts(part_id,tokens) VALUES(?,?)")
             .bind(&part)
-            .bind(tokens(&text).into_iter().collect::<Vec<_>>().join(" "))
+            .bind(
+                tokens(&format!("{original_name}\n{}", text.unwrap_or_default()))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
             .execute(&mut **tx)
             .await?;
+        let lexical_hash = format!(
+            "{}|{}",
+            row.get::<String, _>("content_sha256"),
+            original_name
+        );
         sqlx::query("INSERT INTO kb_lexical_versions(part_id,content_sha256) VALUES(?,?) ON CONFLICT(part_id) DO UPDATE SET content_sha256=excluded.content_sha256")
-            .bind(&part).bind(row.get::<String,_>("content_sha256")).execute(&mut **tx).await?;
+            .bind(&part).bind(lexical_hash).execute(&mut **tx).await?;
     }
     Ok(())
 }
 pub async fn backfill(db: &SqlitePool) -> Result<(), ApiError> {
-    let revisions:Vec<String>=sqlx::query_scalar("SELECT DISTINCT p.revision_id FROM kb_content_parts p LEFT JOIN kb_lexical_versions v USING(part_id) WHERE p.evidence_status='approved' AND p.content_text IS NOT NULL AND (v.part_id IS NULL OR v.content_sha256!=p.content_sha256)").fetch_all(db).await?;
+    let revisions:Vec<String>=sqlx::query_scalar("SELECT DISTINCT p.revision_id FROM kb_content_parts p JOIN kb_asset_revisions r USING(revision_id) JOIN kb_assets a USING(asset_id) LEFT JOIN kb_lexical_versions v USING(part_id) WHERE p.evidence_status IN ('approved','visual_only') AND (v.part_id IS NULL OR v.content_sha256!=COALESCE(p.content_sha256,'') || '|' || a.original_name)").fetch_all(db).await?;
     for revision in revisions {
         let mut tx = db.begin().await?;
         index_revision(&mut tx, &revision).await?;
@@ -102,6 +113,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(result, "p");
+        assert!(tokens("习题册（答案）-第二章.pdf").contains("习题"));
         assert!(query("\" OR NEAR(foo) --")
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "\" ".contains(c)));

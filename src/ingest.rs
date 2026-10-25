@@ -23,7 +23,7 @@ use crate::{auth::require_admin, error::ApiError, state::AppState};
 const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 10 * 1024 * 1024;
-const PARSER_VERSION: &str = "bounded-text-v1";
+const PARSER_VERSION: &str = "bounded-ooxml-math-v2";
 
 pub fn router() -> Router<AppState> {
     Router::new()

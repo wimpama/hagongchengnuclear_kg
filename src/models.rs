@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,20 @@ pub struct ModelConfig {
     pub thinking: String,
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
+    /// Whether generated answers must pass the citation and independent
+    /// support review pipeline. Older persisted JSON predates this setting,
+    /// so the default intentionally keeps the strict path enabled.
+    #[serde(default = "default_answer_verification")]
+    pub answer_verification_enabled: bool,
+    /// When verification is disabled, whether to still expose the retrieved
+    /// course evidence to the student as provenance. Retrieval itself is
+    /// always performed regardless of this setting.
+    #[serde(default = "default_answer_provenance_enabled")]
+    pub answer_provenance_enabled: bool,
+    /// Presentation for provenance when it is enabled: inline source chips or
+    /// a source list below the answer.
+    #[serde(default = "default_answer_provenance_mode")]
+    pub answer_provenance_mode: String,
     #[serde(default = "enabled")]
     pub enabled: bool,
     #[serde(default)]
@@ -54,6 +69,15 @@ fn default_thinking() -> String {
 }
 fn default_reasoning_effort() -> String {
     "high".into()
+}
+fn default_answer_verification() -> bool {
+    true
+}
+fn default_answer_provenance_enabled() -> bool {
+    true
+}
+fn default_answer_provenance_mode() -> String {
+    "inline".into()
 }
 fn default_dimension() -> usize {
     1024
@@ -163,6 +187,9 @@ fn default_config(kind: &str) -> Result<ModelConfig, ApiError> {
         },
         reasoning_effort: std::env::var("LLM_REASONING_EFFORT")
             .unwrap_or_else(|_| default_reasoning_effort()),
+        answer_verification_enabled: true,
+        answer_provenance_enabled: true,
+        answer_provenance_mode: default_answer_provenance_mode(),
         enabled: kind != "asr",
         instructions: String::new(),
         fps: 1.0,
@@ -252,6 +279,7 @@ fn validate(config: &ModelConfig) -> Result<(), ApiError> {
         || !["openai", "deepseek", "ark"].contains(&config.provider.as_str())
         || !["enabled", "disabled"].contains(&config.thinking.as_str())
         || !["none", "low", "high", "max"].contains(&config.reasoning_effort.as_str())
+        || !["inline", "append"].contains(&config.answer_provenance_mode.as_str())
     {
         return Err(ApiError::bad_request("模型名、维度、采样率或协议不正确"));
     }
@@ -452,6 +480,157 @@ pub async fn llm_json(
     llm_response_text(config, &body)
 }
 
+/// Generate ordinary answer text through the provider's SSE endpoint.
+///
+/// This path is used only when the administrator explicitly disables the
+/// post-generation knowledge-base verification pipeline. Retrieval and the
+/// evidence boundary still happen before this function is called; the model's
+/// visible text is forwarded as soon as the provider emits it, while the full
+/// answer is accumulated for persistence.
+pub async fn llm_stream_text(
+    config: &ModelConfig,
+    instructions: &str,
+    input: Value,
+    deltas: &tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<String, ApiError> {
+    if !config.enabled {
+        return Err(ApiError::unavailable("回答模型未启用"));
+    }
+    let key = config
+        .api_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("请配置回答模型密钥"))?;
+    let (url, body) = llm_stream_request(config, instructions, input);
+    let response = client()?
+        .post(url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::unavailable(if error.is_timeout() {
+                "回答模型处理超时，请重试"
+            } else {
+                "回答模型连接失败，请重试"
+            })
+        })?;
+    if !response.status().is_success() {
+        return Err(model_http_error(response.status().as_u16()));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = Vec::<u8>::new();
+    let mut content = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| ApiError::unavailable("回答模型流式连接中断，请重试"))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(event_bytes) = take_sse_event(&mut buffer) {
+            collect_stream_event(config, &event_bytes, deltas, &mut content)?;
+        }
+    }
+    if !buffer.is_empty() {
+        collect_stream_event(config, &buffer, deltas, &mut content)?;
+    }
+    if content.is_empty() {
+        return Err(ApiError::unavailable("回答模型未返回可读内容，请重试"));
+    }
+    Ok(content)
+}
+
+fn llm_stream_request(config: &ModelConfig, instructions: &str, input: Value) -> (String, Value) {
+    let deepseek = config.provider == "deepseek";
+    if config.protocol == "chat" {
+        let mut messages = vec![json!({"role":"system","content":instructions})];
+        messages.extend(input.as_array().cloned().unwrap_or_default());
+        let mut body = json!({
+            "model": config.model,
+            "messages": messages,
+            "stream": true,
+        });
+        if deepseek {
+            body["max_tokens"] = json!(16000);
+            body["thinking"] = json!({"type": config.thinking});
+            if config.thinking == "enabled" {
+                body["reasoning_effort"] = json!(config.reasoning_effort);
+            }
+        } else {
+            body["max_completion_tokens"] = json!(5000);
+        }
+        (config.endpoint("chat/completions"), body)
+    } else {
+        (
+            config.endpoint("responses"),
+            json!({
+                "model": config.model,
+                "instructions": instructions,
+                "input": input,
+                "stream": true,
+                "store": false,
+                "max_output_tokens": 5000,
+            }),
+        )
+    }
+}
+
+fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let position = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (position, 4))
+        .or_else(|| {
+            buffer
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| (position, 2))
+        })?;
+    Some(buffer.drain(..position.0 + position.1).collect())
+}
+
+fn collect_stream_event(
+    config: &ModelConfig,
+    event_bytes: &[u8],
+    deltas: &tokio::sync::mpsc::UnboundedSender<String>,
+    content: &mut String,
+) -> Result<(), ApiError> {
+    let event = String::from_utf8_lossy(event_bytes);
+    for line in event.lines() {
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            continue;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(data)
+            .map_err(|_| ApiError::unavailable("回答模型流式返回格式不正确，请重试"))?;
+        if let Some(message) = payload.pointer("/error/message").and_then(Value::as_str) {
+            return Err(ApiError::unavailable(format!(
+                "回答模型调用失败：{message}"
+            )));
+        }
+        let delta = if config.protocol == "chat" {
+            payload
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+        } else {
+            payload
+                .pointer("/delta")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    payload
+                        .pointer("/response/output_text/delta")
+                        .and_then(Value::as_str)
+                })
+        };
+        // DeepSeek emits reasoning_content in thinking mode. It is
+        // deliberately ignored; only the answer content reaches the client.
+        if let Some(delta) = delta.filter(|value| !value.is_empty()) {
+            content.push_str(delta);
+            let _ = deltas.send(delta.to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn llm_request(
     config: &ModelConfig,
     instructions: &str,
@@ -602,6 +781,78 @@ mod tests {
             json!({"choices":[{"finish_reason":"length","message":{"content":"{\"ok\":"}}]});
         assert!(llm_response_text(&config, &truncated).is_err());
     }
+
+    #[test]
+    fn legacy_model_config_defaults_to_strict_answer_verification() {
+        let config: ModelConfig = serde_json::from_value(json!({
+            "kind": "llm",
+            "baseUrl": "https://api.deepseek.com",
+            "model": "deepseek-flash"
+        }))
+        .unwrap();
+        assert!(config.answer_verification_enabled);
+        assert!(config.answer_provenance_enabled);
+        assert_eq!(config.answer_provenance_mode, "inline");
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["answerVerificationEnabled"],
+            true
+        );
+
+        let disabled: ModelConfig = serde_json::from_value(json!({
+            "kind": "llm",
+            "baseUrl": "https://api.deepseek.com",
+            "model": "deepseek-flash",
+            "answerVerificationEnabled": false
+        }))
+        .unwrap();
+        assert!(!disabled.answer_verification_enabled);
+        assert!(disabled.answer_provenance_enabled);
+        assert_eq!(disabled.answer_provenance_mode, "inline");
+    }
+
+    #[test]
+    fn streaming_request_and_parser_forward_answer_content_only() {
+        let mut config = default_config("llm").unwrap();
+        config.provider = "deepseek".into();
+        config.base_url = "https://api.deepseek.com".into();
+        config.protocol = "chat".into();
+        config.thinking = "enabled".into();
+        let (url, body) = llm_stream_request(
+            &config,
+            "只回答资料内内容",
+            json!([{"role":"user","content":"问题"}]),
+        );
+        assert_eq!(url, "https://api.deepseek.com/chat/completions");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut answer = String::new();
+        collect_stream_event(
+            &config,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"内部思考"}}]}
+
+"#
+            .as_bytes(),
+            &tx,
+            &mut answer,
+        )
+        .unwrap();
+        collect_stream_event(
+            &config,
+            r#"data: {"choices":[{"delta":{"content":"答案"}}]}
+
+"#
+            .as_bytes(),
+            &tx,
+            &mut answer,
+        )
+        .unwrap();
+        assert_eq!(answer, "答案");
+        assert_eq!(rx.try_recv().unwrap(), "答案");
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn encrypted_keys_are_randomized_authenticated_and_never_serialized() {
         let cipher = Aes256Gcm::new_from_slice(&[9; 32]).unwrap();

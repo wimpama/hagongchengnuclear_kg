@@ -571,6 +571,12 @@ async fn index_revision(state: &AppState, job: &str, rev: &str) -> Result<(), Ap
     if parts.is_empty() {
         return Err(ApiError::bad_request("没有审核后的可检索内容"));
     }
+    let original_name: String = sqlx::query_scalar(
+        "SELECT original_name FROM kb_assets WHERE asset_id=? AND deleted_at IS NULL",
+    )
+    .bind(&current.asset)
+    .fetch_one(&state.db)
+    .await?;
     sqlx::query("UPDATE kb_jobs SET progress_total=?,progress_completed=0,progress_stage='embedding' WHERE job_id=? AND state='running'")
         .bind(parts.len() as i64).bind(job).execute(&state.db).await?;
     let mut ids = Vec::new();
@@ -579,8 +585,12 @@ async fn index_revision(state: &AppState, job: &str, rev: &str) -> Result<(), Ap
         let part_id: String = part.get("part_id");
         let modality: String = part.get("modality");
         let hash: String = part.get("content_sha256");
-        let point = point_id(rev, &part_id, &fingerprint, &hash);
-        let payload = json!({"source_system":"existing-course-api","course_id":current.course,"node_id":current.node,"asset_id":current.asset,"revision_id":rev,"part_id":part_id,"modality":modality,"config_fingerprint":fingerprint,"content_sha256":hash});
+        // Include the original filename in the embedding input and point
+        // identity so a reindex refreshes old vectors when the searchable
+        // metadata changes. Existing points remain readable until replaced.
+        let embedding_hash = format!("{hash}|{original_name}");
+        let point = point_id(rev, &part_id, &fingerprint, &embedding_hash);
+        let payload = json!({"source_system":"existing-course-api","course_id":current.course,"node_id":current.node,"asset_id":current.asset,"revision_id":rev,"part_id":part_id,"modality":modality,"source_name":original_name,"config_fingerprint":fingerprint,"content_sha256":hash});
         sqlx::query("INSERT INTO kb_vector_records(vector_record_id,collection_id,revision_id,part_id,qdrant_point_id,modality,dimensions,status) VALUES(?,?,?,?,?,?,?,'pending') ON CONFLICT(collection_id,part_id) DO UPDATE SET qdrant_point_id=excluded.qdrant_point_id,status=CASE WHEN kb_vector_records.status='verified' THEN kb_vector_records.status ELSE 'pending' END")
             .bind(Uuid::new_v5(&Uuid::NAMESPACE_URL,format!("record:{collection_id}:{part_id}").as_bytes()).to_string()).bind(&collection_id).bind(rev).bind(&part_id).bind(&point).bind(&modality).bind(config.dimension as i64).execute(&state.db).await?;
         if !verify_point(state, &collection, &point, &payload, config.dimension).await? {
@@ -588,13 +598,18 @@ async fn index_revision(state: &AppState, job: &str, rev: &str) -> Result<(), Ap
             let media_key: Option<String> = part.get("media_storage_key");
             let mut input = Vec::new();
             if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
-                input.push(json!({"type":"text","text":text}));
+                input.push(json!({"type":"text","text":format!("课程资料文件名：{original_name}\n资料内容：{text}")}));
             }
             if matches!(modality.as_str(), "image" | "video") {
                 let key = media_key
                     .as_deref()
                     .ok_or_else(|| ApiError::bad_request("视觉片段缺少媒体文件"))?;
                 state.storage.ensure_local(key).await?;
+                if !input.iter().any(|item| item["type"] == "text") {
+                    input.push(
+                        json!({"type":"text","text":format!("课程资料文件名：{original_name}")}),
+                    );
+                }
                 input.push(
                     embedding::media_input(state.storage.local_dir(), key, &modality, config.fps)
                         .await?,
@@ -968,6 +983,9 @@ mod tests {
             provider: "ark".into(),
             thinking: "disabled".into(),
             reasoning_effort: "high".into(),
+            answer_verification_enabled: true,
+            answer_provenance_enabled: true,
+            answer_provenance_mode: "inline".into(),
             base_url: "http://unused.invalid".into(),
             model: "fixture".into(),
             dimension: 2,

@@ -135,6 +135,8 @@ pub async fn extract_document(
         .map_err(|_| ApiError::bad_request("Office 文件结构无效，未生成可审核正文"))?;
     let message = if pages.is_empty() {
         "未提取到正文；扫描PDF需OCR，其他资料可补充教师确认正文"
+    } else if mime.contains("wordprocessingml") {
+        "已提取正文及 Word 原生公式；公式已保留上下标、分式、根号和多行结构并转为 LaTeX，请仍逐项核对公式、单位、图表和专业术语后审核"
     } else {
         "正文已提取，请逐页核对公式、单位、图表和专业术语后审核；图片与声音不视为已理解"
     };
@@ -198,46 +200,7 @@ pub(crate) async fn run_bounded(
 // Standard-library-only extraction. Never unpack the archive or execute
 // macros/relationships. XML DTD/entity constructs and excessive expansion are
 // rejected before parsing; the archive is read only in bounded members.
-const OOXML_EXTRACTOR: &str = r#"
-import sys,zipfile,json,re,xml.etree.ElementTree as ET
-path,kind=sys.argv[1:3]
-with zipfile.ZipFile(path) as archive:
-    entries=archive.infolist()
-    if len(entries)>10000 or sum(v.file_size for v in entries)>100*1024*1024:
-        raise ValueError('archive expansion limit')
-    if any(v.file_size>20*1024*1024 or v.flag_bits & 1 or (v.file_size>1024*1024 and v.file_size>max(v.compress_size,1)*1000) for v in entries):
-        raise ValueError('unsafe archive')
-    names=archive.namelist()
-    if kind=='docx':
-        selected=['word/document.xml']
-    else:
-        selected=sorted((v for v in names if re.fullmatch(r'ppt/slides/slide[0-9]+\.xml',v)),key=lambda v:int(re.search(r'([0-9]+)\.xml$',v).group(1)))
-    if not selected or any(name not in names for name in selected):
-        raise ValueError('missing document body')
-    pages=[]
-    for index,name in enumerate(selected):
-        info=archive.getinfo(name)
-        if info.file_size>20*1024*1024: raise ValueError('xml size limit')
-        xml=archive.read(name)
-        if b'<!DOCTYPE' in xml.upper() or b'<!ENTITY' in xml.upper(): raise ValueError('DTD not allowed')
-        root=ET.fromstring(xml)
-        paragraphs=[]
-        for paragraph in root.iter():
-            if paragraph.tag.rsplit('}',1)[-1]!='p': continue
-            pieces=[]
-            for node in paragraph.iter():
-                local=node.tag.rsplit('}',1)[-1]
-                if local=='t' and node.text: pieces.append(node.text)
-                elif local=='tab': pieces.append('\t')
-                elif local=='br': pieces.append('\n')
-            text=''.join(pieces).strip()
-            if text: paragraphs.append(text)
-        text='\n'.join(paragraphs)
-        if text: pages.append({'text':text,'page':index+1 if kind=='pptx' else None})
-    output=json.dumps(pages,ensure_ascii=False)
-    if len(output.encode('utf8'))>10*1024*1024: raise ValueError('output limit')
-    sys.stdout.buffer.write(output.encode('utf8'))
-"#;
+const OOXML_EXTRACTOR: &str = include_str!("../processing/ooxml.py");
 
 #[cfg(test)]
 mod tests {
@@ -290,5 +253,16 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn extracts_word_omml_math_as_latex_without_dropping_structure() {
+        let pages = fixture_and_extract(
+            r#"<w:document xmlns:w="urn:word" xmlns:m="urn:math"><w:body><w:p><w:r><w:t>截面 </w:t></w:r><m:oMath><m:sSup><m:e><m:r><m:t>10</m:t></m:r></m:e><m:sup><m:r><m:t>-24</m:t></m:r></m:sup></m:sSup><m:f><m:num><m:r><m:t>a</m:t></m:r></m:num><m:den><m:r><m:t>b</m:t></m:r></m:den></m:f></m:oMath></w:p></w:body></w:document>"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].text, r"截面 \({10}^{-24}\frac{a}{b}\)");
     }
 }

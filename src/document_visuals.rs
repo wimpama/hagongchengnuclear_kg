@@ -77,8 +77,8 @@ impl Drop for Workspace {
     }
 }
 
-/// PDF/PPTX never silently fall back to text-only extraction. DOCX retains
-/// its existing bounded OOXML text parser.
+/// PDF/PPTX never silently fall back to text-only extraction. DOCX uses the
+/// bounded OOXML parser, including Word OMML formulas converted to LaTeX.
 pub async fn prepare(
     storage: &BlobStore,
     key: &str,

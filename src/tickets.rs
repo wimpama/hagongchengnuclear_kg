@@ -676,6 +676,7 @@ mod tests {
             environment: crate::config::Environment::Development,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: "sqlite::memory:".into(),
+            ai_log_dir: std::path::PathBuf::from("data/test-ai-logs"),
             qdrant: qdrant_config.clone(),
             auth: auth_config.clone(),
             storage: StorageConfig::Local {

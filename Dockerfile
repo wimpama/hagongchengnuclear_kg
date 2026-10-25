@@ -10,6 +10,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY processing/pdf.py ./processing/pdf.py
+COPY processing/ooxml.py ./processing/ooxml.py
 
 RUN cargo build --release --locked --jobs 1 --bin course-kb-server
 

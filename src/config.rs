@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub environment: Environment,
     pub bind_addr: SocketAddr,
     pub database_url: String,
+    pub ai_log_dir: PathBuf,
     pub qdrant: QdrantConfig,
     pub auth: AuthConfig,
     pub storage: StorageConfig,
@@ -95,6 +96,10 @@ impl AppConfig {
                     .replace('\\', "/")
             )
         });
+        let ai_log_dir = env::var_os("KB_AI_LOG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("logs").join("ai"))
+            .join(environment.name());
         let local_dir = if !prod {
             optional_env("KB_UPLOADS_DIR").map(PathBuf::from)
         } else {
@@ -199,6 +204,7 @@ impl AppConfig {
             environment,
             bind_addr,
             database_url,
+            ai_log_dir,
             qdrant: QdrantConfig {
                 http_url,
                 grpc_url,
@@ -237,6 +243,7 @@ impl AppConfig {
             environment: Environment::Development,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             database_url: "sqlite::memory:".into(),
+            ai_log_dir: std::path::PathBuf::from("data/test-ai-logs"),
             qdrant: QdrantConfig {
                 http_url: "http://127.0.0.1:6333".parse().unwrap(),
                 grpc_url: "http://127.0.0.1:6334".into(),

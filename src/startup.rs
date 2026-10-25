@@ -109,12 +109,8 @@ fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>> {
 
 fn local_settings(backend: &Path) -> BTreeMap<String, String> {
     let local = backend.join("data/local");
-    let db = |path: &Path| {
-        format!(
-            "sqlite://{}?mode=rwc",
-            path.to_string_lossy().replace('\\', "/")
-        )
-    };
+    let path_text = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let db = |path: &Path| format!("sqlite://{}?mode=rwc", path_text(path));
     BTreeMap::from([
         ("KB_BIND_ADDR".into(), "127.0.0.1:8080".into()),
         (
@@ -126,10 +122,8 @@ fn local_settings(backend: &Path) -> BTreeMap<String, String> {
             db(&local.join("prod/knowledge.sqlite")),
         ),
         ("KB_UPLOADS_DIR".into(), String::new()),
-        (
-            "KB_CACHE_DIR".into(),
-            local.join("cache").to_string_lossy().into_owned(),
-        ),
+        ("KB_CACHE_DIR".into(), path_text(&local.join("cache"))),
+        ("KB_AI_LOG_DIR".into(), path_text(&local.join("logs/ai"))),
         ("KB_STORAGE_BACKEND".into(), "oss".into()),
         ("QDRANT_HTTP_URL".into(), "http://127.0.0.1:16333".into()),
         ("QDRANT_GRPC_URL".into(), "http://127.0.0.1:16334".into()),
@@ -177,6 +171,10 @@ mod tests {
             "sqlite:///workspace/backend/data/local/prod/knowledge.sqlite?mode=rwc"
         );
         assert_eq!(values["QDRANT_HTTP_URL"], "http://127.0.0.1:16333");
+        assert_eq!(
+            values["KB_AI_LOG_DIR"],
+            "/workspace/backend/data/local/logs/ai"
+        );
         assert_eq!(values["KB_STORAGE_BACKEND"], "oss");
         assert!(values["KB_UPLOADS_DIR"].is_empty());
     }

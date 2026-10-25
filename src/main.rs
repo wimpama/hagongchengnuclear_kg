@@ -1,3 +1,4 @@
+mod ai_trace;
 mod auth;
 mod catalog;
 mod chat_context;

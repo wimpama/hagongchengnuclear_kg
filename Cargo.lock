@@ -290,6 +290,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-core",
+ "futures-util",
  "hmac",
  "reqwest",
  "serde",
