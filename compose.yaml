@@ -38,6 +38,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        KB_CARGO_REGISTRY: ${KB_CARGO_REGISTRY:-rsproxy}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s

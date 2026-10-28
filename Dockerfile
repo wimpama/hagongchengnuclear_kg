@@ -5,6 +5,22 @@
 # the image.
 FROM rust:1.94-bookworm AS builder
 
+# This is separate from the Docker image mirror used by BuildKit. Only the
+# build stage uses it; select crates-io to use the original registry instead.
+ARG KB_CARGO_REGISTRY=rsproxy
+ARG TARGETPLATFORM
+ENV CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_HTTP_TIMEOUT=120 \
+    CARGO_NET_RETRY=5
+RUN case "$KB_CARGO_REGISTRY" in \
+      rsproxy) printf '%s\n' \
+        '[source.crates-io]' 'replace-with = "rsproxy-sparse"' \
+        '[source.rsproxy-sparse]' 'registry = "sparse+https://rsproxy.cn/index/"' \
+        > /usr/local/cargo/config.toml ;; \
+      crates-io) ;; \
+      *) printf 'Unsupported KB_CARGO_REGISTRY: %s\n' "$KB_CARGO_REGISTRY" >&2; exit 1 ;; \
+    esac
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./
@@ -14,7 +30,15 @@ COPY processing/pdf.py ./processing/pdf.py
 COPY processing/ooxml.py ./processing/ooxml.py
 COPY processing/spreadsheet.py ./processing/spreadsheet.py
 
-RUN cargo build --release --locked --jobs 1 --bin course-kb-server
+# Registry downloads and compiler outputs survive a failed RUN or source edit
+# on this builder. Fetch again even when reusing layers: cache mounts can be
+# garbage-collected independently of successful image layers.
+RUN --mount=type=cache,id=course-knowledge-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=course-knowledge-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=course-knowledge-target-rust-1.94-${TARGETPLATFORM},target=/build/target,sharing=locked \
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo build --release --locked --offline --jobs 1 --bin course-kb-server \
+    && install -D /build/target/release/course-kb-server /out/course-kb-server
 
 FROM node:22.19.0-bookworm-slim AS document-processing
 WORKDIR /opt/knowledge-processing
@@ -43,7 +67,7 @@ COPY processing/requirements.txt /opt/knowledge-processing/requirements.txt
 RUN python3 -m venv /opt/knowledge-python \
     && /opt/knowledge-python/bin/python3 -m pip install --no-cache-dir -r /opt/knowledge-processing/requirements.txt
 
-COPY --from=builder /build/target/release/course-kb-server /usr/local/bin/course-kb-server
+COPY --from=builder /out/course-kb-server /usr/local/bin/course-kb-server
 COPY --from=document-processing /usr/local/bin/node /usr/local/bin/node
 COPY --from=document-processing /opt/knowledge-processing /opt/knowledge-processing
 
