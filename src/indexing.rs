@@ -1,10 +1,6 @@
 //! Durable, single-worker indexing with immutable reviewed evidence and an
 //! explicit SQLite publication barrier. Qdrant is never an authorization DB.
-use std::{
-    collections::HashSet,
-    sync::{atomic::Ordering, OnceLock},
-    time::Duration,
-};
+use std::{collections::HashSet, sync::atomic::Ordering, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -16,7 +12,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
@@ -28,8 +23,6 @@ use crate::{
     models::{self, ModelConfig},
     state::AppState,
 };
-
-static REVIEW_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -88,7 +81,13 @@ async fn review_asset(
     Path(asset): Path<String>,
 ) -> Result<Json<AssetView>, ApiError> {
     let user = require_admin(&state, &headers).await?;
-    let _guard = REVIEW_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+    let _guard = state.review_lock.try_lock().map_err(|_| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "review_busy",
+            "另一个资料正在审核处理，请稍后重试；本次审核尚未开始",
+        )
+    })?;
     let rev = latest_revision(&state.db, &asset).await?;
     let current = revision(&state.db, &rev).await?;
     if current.review == "approved" {
@@ -102,9 +101,67 @@ async fn review_asset(
             "已发布或撤回版本不可修改，请先创建新修订",
         ));
     }
+    let progress = ReviewProgress {
+        db: &state.db,
+        revision: &rev,
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let started = std::time::Instant::now();
+    progress
+        .set("running", "checking", "正在检查资料片段")
+        .await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(540),
+        review_revision(&state, &asset, &rev, &user.id, &progress),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ApiError::unavailable(
+            "视频审核处理超时，请重试；可先将较长的视频拆分后上传",
+        ))
+    });
+    let (status, message) = match &result {
+        Ok(()) => ("succeeded", "资料审核已通过".to_owned()),
+        Err(error) => ("failed", error.message.clone()),
+    };
+    if progress.set(status, status, message).await.is_err() {
+        tracing::warn!(asset_id=%asset, revision_id=%rev, "could not update review progress");
+    }
+    tracing::info!(asset_id=%asset, revision_id=%rev, elapsed_ms=started.elapsed().as_millis() as u64, status, "knowledge review finished");
+    result?;
+    Ok(Json(ingest::load_asset(&state.db, &asset).await?))
+}
+
+struct ReviewProgress<'a> {
+    db: &'a SqlitePool,
+    revision: &'a str,
+    started_at: String,
+}
+
+impl ReviewProgress<'_> {
+    async fn set(
+        &self,
+        state: &str,
+        stage: &str,
+        message: impl Into<String>,
+    ) -> Result<(), ApiError> {
+        let progress = json!({"state":state,"stage":stage,"message":message.into(),"startedAt":self.started_at});
+        sqlx::query("UPDATE kb_asset_revisions SET extraction_json=json_set(COALESCE(extraction_json,'{}'),'$.reviewProgress',json(?)) WHERE revision_id=?")
+            .bind(progress.to_string()).bind(self.revision).execute(self.db).await?;
+        Ok(())
+    }
+}
+
+async fn review_revision(
+    state: &AppState,
+    asset: &str,
+    rev: &str,
+    actor: &str,
+    progress: &ReviewProgress<'_>,
+) -> Result<(), ApiError> {
     let rows =
         sqlx::query("SELECT * FROM kb_content_parts WHERE revision_id=? ORDER BY part_index")
-            .bind(&rev)
+            .bind(rev)
             .fetch_all(&state.db)
             .await?;
     if rows.is_empty() {
@@ -129,16 +186,26 @@ async fn review_asset(
         let original: String = row
             .get::<Option<String>, _>("media_storage_key")
             .ok_or_else(|| ApiError::bad_request("视频片段缺少原件"))?;
+        progress
+            .set("running", "loading_original", "正在读取视频原件")
+            .await?;
         state.storage.ensure_local(&original).await?;
-        state
-            .storage
-            .put_file(
-                &original,
-                &state.storage.local_dir().join(&original),
-                content_type_for_key(&original),
+        // The upload/import already persisted the original in OSS. Reading it
+        // for FFmpeg must not upload the unchanged original a second time.
+        let range = row
+            .get::<Option<i64>, _>("start_ms")
+            .zip(row.get::<Option<i64>, _>("end_ms"));
+        progress
+            .set(
+                "running",
+                "preparing_video",
+                "正在裁剪视频分段并抽取预览画面",
             )
             .await?;
-        let segments = media::prepare_video(state.storage.local_dir(), &original).await?;
+        let media_started = std::time::Instant::now();
+        let segments =
+            media::prepare_video_range(state.storage.local_dir(), &original, range).await?;
+        tracing::info!(asset_id=%asset, revision_id=%rev, segment_count=segments.len(), elapsed_ms=media_started.elapsed().as_millis() as u64, "review video preparation finished");
         for segment in &segments {
             if segment.storage_key != original {
                 files.keys.push(segment.storage_key.clone());
@@ -149,7 +216,19 @@ async fn review_asset(
         }
         derived.push((row.get::<String, _>("part_id"), original, segments));
     }
-    for key in &files.keys {
+    let upload_started = std::time::Instant::now();
+    for (index, key) in files.keys.iter().enumerate() {
+        progress
+            .set(
+                "running",
+                "uploading_derivatives",
+                format!(
+                    "正在上传视频分段和预览图到 OSS（{}/{}）",
+                    index + 1,
+                    files.keys.len()
+                ),
+            )
+            .await?;
         state
             .storage
             .put_file(
@@ -159,11 +238,17 @@ async fn review_asset(
             )
             .await?;
     }
+    if !files.keys.is_empty() {
+        tracing::info!(asset_id=%asset, revision_id=%rev, file_count=files.keys.len(), elapsed_ms=upload_started.elapsed().as_millis() as u64, "review OSS derivative uploads finished");
+    }
+    progress
+        .set("running", "saving_review", "正在保存审核结果")
+        .await?;
     let mut tx = state.db.begin().await?;
-    ensure_latest_tx(&mut tx, &asset, &rev).await?;
+    ensure_latest_tx(&mut tx, asset, rev).await?;
     let status: String =
         sqlx::query_scalar("SELECT review_status FROM kb_asset_revisions WHERE revision_id=?")
-            .bind(&rev)
+            .bind(rev)
             .fetch_one(&mut *tx)
             .await?;
     if status == "approved" {
@@ -171,7 +256,7 @@ async fn review_asset(
     }
     let vectors: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM kb_vector_records WHERE revision_id=?")
-            .bind(&rev)
+            .bind(rev)
             .fetch_one(&mut *tx)
             .await?;
     if vectors > 0 {
@@ -182,7 +267,7 @@ async fn review_asset(
     let mut next: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(part_index),-1)+1 FROM kb_content_parts WHERE revision_id=?",
     )
-    .bind(&rev)
+    .bind(rev)
     .fetch_one(&mut *tx)
     .await?;
     for (source_id, source_key, segments) in derived {
@@ -224,34 +309,36 @@ async fn review_asset(
                 &metadata,
             );
             sqlx::query("INSERT INTO kb_content_parts(part_id,revision_id,part_index,modality,media_storage_key,start_ms,end_ms,metadata_json,content_sha256,evidence_status) VALUES(?,?,?,'video',?,?,?,?,?,'visual_only')")
-                .bind(Uuid::new_v4().to_string()).bind(&rev).bind(next).bind(&segment.storage_key).bind(segment.start_ms).bind(segment.end_ms).bind(metadata.to_string()).bind(hash).execute(&mut *tx).await?;
+                .bind(Uuid::new_v4().to_string()).bind(rev).bind(next).bind(&segment.storage_key).bind(segment.start_ms).bind(segment.end_ms).bind(metadata.to_string()).bind(hash).execute(&mut *tx).await?;
             next += 1;
         }
     }
     // Missing ASR never prevents visual indexing, but audio without reviewed
     // transcript must not count as semantic evidence.
     sqlx::query("UPDATE kb_content_parts SET evidence_status=CASE WHEN content_text IS NOT NULL AND length(trim(content_text))>0 THEN 'approved' WHEN modality IN ('image','video') THEN 'visual_only' ELSE 'unavailable' END WHERE revision_id=?")
-        .bind(&rev).execute(&mut *tx).await?;
-    let usable:i64=sqlx::query_scalar("SELECT COUNT(*) FROM kb_content_parts WHERE revision_id=? AND evidence_status IN ('approved','visual_only')").bind(&rev).fetch_one(&mut *tx).await?;
+        .bind(rev).execute(&mut *tx).await?;
+    let usable:i64=sqlx::query_scalar("SELECT COUNT(*) FROM kb_content_parts WHERE revision_id=? AND evidence_status IN ('approved','visual_only')").bind(rev).fetch_one(&mut *tx).await?;
     if usable == 0 {
         return Err(ApiError::bad_request(
             "没有可检索正文或视觉素材，请先补充教师确认的字幕/说明",
         ));
     }
     sqlx::query("UPDATE kb_asset_revisions SET review_status='approved',status='review',index_status='pending',review_note=? WHERE revision_id=?")
-        .bind(format!("Reviewed by {}",user.id)).bind(&rev).execute(&mut *tx).await?;
-    crate::lexical::index_revision(&mut tx, &rev).await?;
+        .bind(format!("Reviewed by {actor}")).bind(rev).execute(&mut *tx).await?;
+    sqlx::query("UPDATE kb_asset_revisions SET status='ready',index_status='not_required' WHERE revision_id=? AND asset_id IN (SELECT asset_id FROM kb_assets WHERE evidence_mode='file')")
+        .bind(rev).execute(&mut *tx).await?;
+    crate::lexical::index_revision(&mut tx, rev).await?;
     audit(
         &mut tx,
-        &user.id,
+        actor,
         "asset.review",
-        &asset,
+        asset,
         json!({"revisionId":rev,"retrievablePartCount":usable}),
     )
     .await?;
     tx.commit().await?;
     files.retained = true;
-    Ok(Json(ingest::load_asset(&state.db, &asset).await?))
+    Ok(())
 }
 
 #[derive(Default)]
@@ -310,6 +397,11 @@ async fn reindex_asset(
     let current = revision(&state.db, &rev).await?;
     if current.review != "approved" {
         return Err(ApiError::bad_request("请先审核当前资料版本"));
+    }
+    if ingest::load_asset(&state.db, &asset).await?.evidence_mode == "file" {
+        return Err(ApiError::bad_request(
+            "此资料为直接证据，不需要向量化，审核后可直接发布",
+        ));
     }
     let config = models::load(&state, "embedding").await?;
     require_config(&config)?;
@@ -402,10 +494,14 @@ fn kick_worker(state: AppState) {
             }
         }
         let _running = RunningGuard(state.worker_running.clone());
-        let _guard = state.workflow_lock.lock().await;
         loop {
-            if let Err(error) = drain_jobs(&state).await {
-                tracing::warn!(code = error.code, "index worker will retry queued tasks");
+            {
+                // Never keep the workflow locked while the worker is idle.
+                // Editors also use this lock to create immutable revisions.
+                let _guard = state.workflow_lock.lock().await;
+                if let Err(error) = drain_jobs(&state).await {
+                    tracing::warn!(code = error.code, "index worker will retry queued tasks");
+                }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -420,6 +516,7 @@ pub async fn resume_jobs(state: AppState) {
         let mut tx=state.db.begin().await?;
         sqlx::query("UPDATE kb_jobs SET state='queued',available_at=CURRENT_TIMESTAMP WHERE (job_type IN ('index_revision','asset_cleanup') AND state='running') OR (job_type='asset_cleanup' AND state='failed')").execute(&mut *tx).await?;
         sqlx::query("UPDATE kb_index_outbox SET state='pending',updated_at=CURRENT_TIMESTAMP WHERE state='running'").execute(&mut *tx).await?;
+        sqlx::query("UPDATE kb_asset_revisions SET extraction_json=json_set(extraction_json,'$.reviewProgress.state','failed','$.reviewProgress.stage','interrupted','$.reviewProgress.message','上次审核因服务重启中断，请重新点击审核通过') WHERE json_extract(extraction_json,'$.reviewProgress.state')='running'").execute(&mut *tx).await?;
         tx.commit().await
     }.await;
     if reset.is_err() {
@@ -813,6 +910,37 @@ async fn update_status(
 async fn publish(state: &AppState, asset: &str, actor: &str) -> Result<(), ApiError> {
     let rev = latest_revision(&state.db, asset).await?;
     let current = revision(&state.db, &rev).await?;
+    if ingest::load_asset(&state.db, asset).await?.evidence_mode == "file" {
+        if current.review != "approved" || current.index != "not_required" {
+            return Err(ApiError::bad_request("直接证据需要先审核"));
+        }
+        let mut tx = state.db.begin().await?;
+        ensure_latest_tx(&mut tx, asset, &rev).await?;
+        sqlx::query("UPDATE kb_asset_revisions SET status='ready' WHERE asset_id=? AND status='published' AND revision_id!=?")
+            .bind(asset).bind(&rev).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE kb_asset_revisions SET status='published',published_at=CURRENT_TIMESTAMP WHERE revision_id=? AND review_status='approved' AND index_status='not_required'")
+            .bind(&rev).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(ApiError::bad_request("审核状态已变化，请刷新"));
+        }
+        sqlx::query(
+            "UPDATE kb_assets SET published_revision_id=? WHERE asset_id=? AND deleted_at IS NULL",
+        )
+        .bind(&rev)
+        .bind(asset)
+        .execute(&mut *tx)
+        .await?;
+        audit(
+            &mut tx,
+            actor,
+            "asset.published",
+            asset,
+            json!({"revisionId":rev,"evidenceMode":"file"}),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     if current.review != "approved" || current.index != "verified" {
         return Err(ApiError::bad_request("必须完成审核和向量核验后才能发布"));
     }
@@ -877,7 +1005,7 @@ async fn publish(state: &AppState, asset: &str, actor: &str) -> Result<(), ApiEr
             "课程已有不同活动索引，需要完整课程重建",
         ));
     }
-    let foreign:i64=sqlx::query_scalar("SELECT COUNT(*) FROM kb_assets a JOIN kb_course_nodes n ON a.node_id=n.node_id JOIN kb_asset_revisions r ON r.revision_id=a.published_revision_id WHERE n.course_id=? AND a.deleted_at IS NULL AND (r.collection_id IS NULL OR r.collection_id!=?)").bind(&current.course).bind(&collection).fetch_one(&mut *tx).await?;
+    let foreign:i64=sqlx::query_scalar("SELECT COUNT(*) FROM kb_assets a JOIN kb_course_nodes n ON a.node_id=n.node_id JOIN kb_asset_revisions r ON r.revision_id=a.published_revision_id WHERE n.course_id=? AND a.deleted_at IS NULL AND a.evidence_mode='content' AND (r.collection_id IS NULL OR r.collection_id!=?)").bind(&current.course).bind(&collection).fetch_one(&mut *tx).await?;
     if foreign > 0 {
         return Err(ApiError::bad_request(
             "课程已有其他索引代际的已发布资料，需要成套重建后切换",
@@ -968,6 +1096,133 @@ async fn audit(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires KB_TEST_VIDEO_PATH and local ffmpeg/ffprobe; uses only an isolated processing directory"]
+    async fn supplied_video_can_be_probed_saved_and_reviewed() {
+        let source = std::env::var_os("KB_TEST_VIDEO_PATH").expect("set KB_TEST_VIDEO_PATH");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data/verification")
+            .join(format!("video-range-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let key = format!("{}.mp4", Uuid::new_v4());
+        tokio::fs::copy(source, root.join(&key)).await.unwrap();
+        let (mut state, _) = crate::db::test_published_state().await;
+        state.storage = crate::storage::BlobStore::new(crate::config::StorageConfig::Local {
+            local_dir: root.clone(),
+        });
+        sqlx::query("UPDATE kb_assets SET asset_type='video',mime_type='video/mp4',storage_key=? WHERE asset_id='a'")
+            .bind(&key).execute(&state.db).await.unwrap();
+        let duration = media::probe_duration(&root.join(&key), "video")
+            .await
+            .unwrap();
+        assert_eq!(duration, 112_384);
+        // This also exercises legacy-upload metadata enrichment and duration
+        // validation before creating an immutable revision from the real file.
+        ingest::save_parts_checked(
+            &state,
+            "a",
+            "admin",
+            serde_json::from_value(json!({
+                "revisionId":"r", "parts":[{
+                    "modality":"video", "text":"", "startSeconds":0, "endSeconds":112,
+                }],
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let rev = latest_revision(&state.db, "a").await.unwrap();
+        let progress = ReviewProgress {
+            db: &state.db,
+            revision: &rev,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let started = std::time::Instant::now();
+        review_revision(&state, "a", &rev, "admin", &progress)
+            .await
+            .unwrap();
+        let rows = sqlx::query("SELECT start_ms,end_ms,media_storage_key,metadata_json FROM kb_content_parts WHERE revision_id=? AND modality='video' ORDER BY start_ms")
+            .bind(&rev).fetch_all(&state.db).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (
+                rows[0].get::<i64, _>("start_ms"),
+                rows[0].get::<i64, _>("end_ms")
+            ),
+            (0, 60_000)
+        );
+        assert_eq!(
+            (
+                rows[1].get::<i64, _>("start_ms"),
+                rows[1].get::<i64, _>("end_ms")
+            ),
+            (60_000, 112_000)
+        );
+        let asset = ingest::load_asset(&state.db, "a").await.unwrap();
+        assert_eq!(asset.review_status, "approved");
+        assert!(asset.published);
+        let extraction = asset.extraction.unwrap();
+        assert_eq!(extraction["reviewProgress"]["stage"], "saving_review");
+        eprintln!("supplied video: source duration {duration} ms; {} prepared clips; review without OSS network took {:.3} s", rows.len(), started.elapsed().as_secs_f64());
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            tokio::fs::remove_file(entry.path()).await.unwrap();
+        }
+        tokio::fs::remove_dir(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_index_worker_releases_the_editing_lock() {
+        let state = crate::db::test_state().await;
+        kick_worker(state.clone());
+        // Let the worker enter its idle sleep after inspecting the empty queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let guard = tokio::time::timeout(Duration::from_millis(250), state.workflow_lock.lock())
+            .await
+            .expect("an idle index worker must not block fragment editing");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn review_progress_preserves_parser_metadata_and_recovers_after_restart() {
+        let (state, _) = crate::db::test_published_state().await;
+        sqlx::query("UPDATE kb_asset_revisions SET extraction_json=? WHERE revision_id='r'")
+            .bind(
+                json!({"sourceDurationMs":112384,"sourceName":"video.mp4","message":"需要校对"})
+                    .to_string(),
+            )
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let progress = ReviewProgress {
+            db: &state.db,
+            revision: "r",
+            started_at: chrono::Utc::now().to_rfc3339(),
+        };
+        progress
+            .set("running", "preparing_video", "正在裁剪视频")
+            .await
+            .unwrap();
+        let extraction = ingest::load_asset(&state.db, "a")
+            .await
+            .unwrap()
+            .extraction
+            .unwrap();
+        assert_eq!(extraction["reviewProgress"]["state"], "running");
+        assert_eq!(extraction["sourceDurationMs"], 112384);
+        resume_jobs(state.clone()).await;
+        let extraction = ingest::load_asset(&state.db, "a")
+            .await
+            .unwrap()
+            .extraction
+            .unwrap();
+        assert_eq!(extraction["reviewProgress"]["state"], "failed");
+        assert_eq!(extraction["reviewProgress"]["stage"], "interrupted");
+        assert_eq!(extraction["sourceName"], "video.mp4");
+        assert_eq!(extraction["sourceDurationMs"], 112384);
+        assert_eq!(extraction["message"], "需要校对");
+    }
+
     async fn published_fixture() -> (AppState, tokio::task::JoinHandle<()>) {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
         for migration in [
@@ -978,6 +1233,12 @@ mod tests {
         ] {
             sqlx::raw_sql(migration).execute(&db).await.unwrap();
         }
+        sqlx::query(
+            "ALTER TABLE kb_assets ADD COLUMN evidence_mode TEXT NOT NULL DEFAULT 'content'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         let model = ModelConfig {
             kind: "embedding".into(),
             provider: "ark".into(),

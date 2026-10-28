@@ -7,10 +7,12 @@ FROM rust:1.94-bookworm AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
 COPY src ./src
 COPY migrations ./migrations
 COPY processing/pdf.py ./processing/pdf.py
 COPY processing/ooxml.py ./processing/ooxml.py
+COPY processing/spreadsheet.py ./processing/spreadsheet.py
 
 RUN cargo build --release --locked --jobs 1 --bin course-kb-server
 

@@ -25,6 +25,8 @@ pub enum UserRole {
 pub struct AuthenticatedUser {
     pub id: String,
     pub role: UserRole,
+    #[serde(default)]
+    pub profile: Option<crate::student_profiles::StudentProfile>,
 }
 
 #[derive(Debug, Error)]
@@ -205,7 +207,8 @@ fn parse_identity(mut raw: Value) -> Result<AuthenticatedUser, AuthError> {
         Some("STUDENT") => UserRole::Student,
         _ => return Err(AuthError::InvalidIdentity),
     };
-    Ok(AuthenticatedUser { id, role })
+    let profile = (role == UserRole::Student).then(|| crate::student_profiles::parse(&raw));
+    Ok(AuthenticatedUser { id, role, profile })
 }
 
 #[cfg(test)]

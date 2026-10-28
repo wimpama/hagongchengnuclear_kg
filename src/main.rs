@@ -14,6 +14,7 @@ mod gateway;
 mod indexing;
 mod ingest;
 mod knowledge;
+mod learning;
 mod lexical;
 mod local_runtime;
 mod media;
@@ -25,6 +26,8 @@ mod startup;
 mod state;
 mod storage;
 mod storage_migration;
+mod student_profiles;
+mod teacher;
 mod tickets;
 
 use anyhow::Context;
@@ -152,6 +155,7 @@ async fn build_tenant(config: AppConfig) -> anyhow::Result<Router> {
         .map_err(|_| anyhow::anyhow!("build lexical index"))?;
     indexing::resume_jobs(state.clone()).await;
     question_attachments::start_cleanup(state.clone());
+    learning::start(state.clone());
     storage::start_cache_cleanup(state.storage.clone());
 
     let app = Router::new()
@@ -160,6 +164,7 @@ async fn build_tenant(config: AppConfig) -> anyhow::Result<Router> {
         .merge(courseware::router())
         .merge(models::router())
         .merge(knowledge::router())
+        .merge(teacher::router())
         .merge(question_attachments::router())
         .merge(indexing::router())
         .merge(tickets::router())

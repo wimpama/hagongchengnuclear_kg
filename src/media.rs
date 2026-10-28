@@ -77,9 +77,18 @@ pub struct MediaSegment {
 /// Prepare original video segments for native visual embeddings and a frame
 /// for a separately verified vision-capable answer model. No audio transcript
 /// is implied by either operation.
+#[cfg(test)]
 pub async fn prepare_video(
     root: &std::path::Path,
     storage_key: &str,
+) -> Result<Vec<MediaSegment>, ApiError> {
+    prepare_video_range(root, storage_key, None).await
+}
+
+pub async fn prepare_video_range(
+    root: &std::path::Path,
+    storage_key: &str,
+    range: Option<(i64, i64)>,
 ) -> Result<Vec<MediaSegment>, ApiError> {
     validate_key(storage_key)?;
 
@@ -90,18 +99,26 @@ pub async fn prepare_video(
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_UPLOAD {
         return Err(ApiError::bad_request("视频原件为空或超过100MB上传限制"));
     }
-    let duration = probe_duration(&input).await?;
+    let duration = probe_duration(&input, "video").await?;
     if duration > MAX_DURATION_MS {
         return Err(ApiError::bad_request(
             "视频超过两小时，请按课程内容拆分后上传",
         ));
     }
+    let (range_start, range_end) = range.unwrap_or((0, duration));
+    if range_start < 0 || range_end <= range_start || range_end > duration + 100 {
+        return Err(ApiError::bad_request("片段时间范围超出原视频时长"));
+    }
+    let range_end = range_end.min(duration);
     let mut generated = GeneratedFiles::default();
     let mut result = Vec::new();
-    let reuse_original = duration <= SEGMENT_MS && metadata.len() <= MAX_SEGMENT;
-    let mut start = 0;
-    while start < duration {
-        let end = (start + SEGMENT_MS).min(duration);
+    let reuse_original = range_start == 0
+        && range_end == duration
+        && duration <= SEGMENT_MS
+        && metadata.len() <= MAX_SEGMENT;
+    let mut start = range_start;
+    while start < range_end {
+        let end = (start + SEGMENT_MS).min(range_end);
         let segment_key = if reuse_original {
             storage_key.to_owned()
         } else {
@@ -188,7 +205,8 @@ struct ProbeStream {
     codec_type: Option<String>,
 }
 
-async fn probe_duration(input: &Path) -> Result<i64, ApiError> {
+/// Read the original file's duration, never a teacher-supplied time range.
+pub async fn probe_duration(input: &Path, kind: &str) -> Result<i64, ApiError> {
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -207,16 +225,16 @@ async fn probe_duration(input: &Path) -> Result<i64, ApiError> {
         .streams
         .unwrap_or_default()
         .iter()
-        .any(|stream| stream.codec_type.as_deref() == Some("video"))
+        .any(|stream| stream.codec_type.as_deref() == Some(kind))
     {
-        return Err(ApiError::bad_request("该文件不包含视频画面"));
+        return Err(ApiError::bad_request("该文件不包含所需的音视频轨道"));
     }
     let seconds = probe
         .format
         .and_then(|f| f.duration)
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0 && *v <= 86_400.0)
-        .ok_or_else(|| ApiError::bad_request("无法确定有效的视频时长"))?;
+        .ok_or_else(|| ApiError::bad_request("无法确定有效的媒体时长"))?;
     Ok((seconds * 1000.0).ceil() as i64)
 }
 
@@ -448,11 +466,29 @@ mod tests {
                 assert_ne!(segments[0].storage_key, key);
                 assert_eq!(segments[0].end_ms, 60_000);
                 assert_eq!(segments[1].start_ms, 60_000);
-                let local_duration = probe_duration(&root.join(&segments[1].storage_key))
+                let local_duration = probe_duration(&root.join(&segments[1].storage_key), "video")
                     .await
                     .unwrap();
                 assert!((900..=1500).contains(&local_duration));
                 assert!(local_duration < segments[1].start_ms);
+                let selected = prepare_video_range(&root, &key, Some((10_500, 14_250)))
+                    .await
+                    .unwrap();
+                assert_eq!(selected.len(), 1);
+                assert_eq!((selected[0].start_ms, selected[0].end_ms), (10_500, 14_250));
+                assert_ne!(selected[0].storage_key, key);
+                cleanup.paths.push(root.join(&selected[0].storage_key));
+                cleanup
+                    .paths
+                    .push(root.join(selected[0].frame_storage_key.as_ref().unwrap()));
+                let selected_duration =
+                    probe_duration(&root.join(&selected[0].storage_key), "video")
+                        .await
+                        .unwrap();
+                assert!((3500..=4100).contains(&selected_duration));
+                assert!(prepare_video_range(&root, &key, Some((60_000, 63_000)))
+                    .await
+                    .is_err());
             }
         }
     }

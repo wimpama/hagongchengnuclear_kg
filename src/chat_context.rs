@@ -242,7 +242,14 @@ pub async fn load(
             let role: String = row.get("role");
             let mut text = decode(row.get("content_json"));
             let valid = role != "assistant"
-                || memory_answer_valid(state, scope, &text, row.get("citations_json")).await?;
+                || memory_answer_valid(
+                    state,
+                    scope,
+                    &text,
+                    row.get("citations_json"),
+                    row.get("presentation_json"),
+                )
+                .await?;
             if !valid {
                 text = "较早回答的来源已更新或撤回，具体内容不可继续使用。".into();
             }
@@ -262,7 +269,7 @@ pub async fn load(
                     .unwrap_or(json!([]));
             let attachment_context =
                 attachment_references(state, conversation, &attachment_ids).await?;
-            history.push(json!({"messageId":row.get::<String,_>("message_id"),"role":role,"text":bounded_text(&text,8000),"textTruncated":text.len()>8000,"attachmentIds":attachment_ids,"attachmentReferences":attachment_context,"citations":citations,"suggestedQuestions":if valid {presentation["suggestedQuestions"].clone()} else {json!([])},"followUpSources":if valid {presentation["followUpSources"].clone()} else {json!([])},"trust":"conversation_only_not_evidence"}));
+            history.push(json!({"messageId":row.get::<String,_>("message_id"),"role":role,"text":bounded_text(&text,8000),"textTruncated":text.len()>8000,"attachmentIds":attachment_ids,"attachmentReferences":attachment_context,"citations":citations,"answerKind":presentation["answerKind"],"suggestedQuestions":if valid {presentation["suggestedQuestions"].clone()} else {json!([])},"followUpSources":if valid {presentation["followUpSources"].clone()} else {json!([])},"trust":"conversation_only_not_evidence"}));
         }
         let total = json!({"earlierSummary":summary,"recentMessages":history})
             .to_string()

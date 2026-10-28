@@ -126,9 +126,9 @@ try {
     }
     if ($resolvedPython) {
         Set-LocalEnvironment 'KB_PYTHON_BIN' $resolvedPython
-        & $resolvedPython -I -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('pypdf') else 1)"
+        & $resolvedPython -I -c "import importlib.util,sys; missing=[name for name in ('pypdf','openpyxl','xlrd','defusedxml') if importlib.util.find_spec(name) is None]; print('Missing Python packages: '+', '.join(missing)) if missing else None; sys.exit(bool(missing))"
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'PDF parsing needs pypdf. Install once with the selected Python: -m pip install -r processing/requirements.txt'
+            Write-Warning 'Some PDF/Excel parsing packages are missing. Install once with the selected Python: -m pip install -r processing/requirements.txt'
         }
     } else {
         Write-Warning 'A working Python interpreter was not found; PDF/DOCX/PPTX extraction needs Python. Set KB_PYTHON_BIN in back_end/.env to its executable path.'

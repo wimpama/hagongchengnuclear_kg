@@ -54,6 +54,77 @@ impl BlobStore {
         matches!(self.config, StorageConfig::Oss { .. })
     }
 
+    /// Microsoft Office Viewer fetches the source itself, so it cannot use a
+    /// localhost URL or our bearer token. Authorize the published workbook
+    /// first, then grant GET on exactly one object for ten minutes.
+    pub fn office_read_url(&self, key: &str) -> Result<String, ApiError> {
+        self.office_read_url_at(key, Utc::now())
+    }
+
+    fn office_read_url_at(
+        &self,
+        key: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<String, ApiError> {
+        validate_key(key)?;
+        if key.starts_with("question-") || !key.ends_with(".xlsx") && !key.ends_with(".xls") {
+            return Err(ApiError::bad_request("仅支持课程 Excel 文件在线预览"));
+        }
+        let (endpoint, region, bucket, access_key_id, access_key_secret) = match &self.config {
+            StorageConfig::Oss {
+                endpoint,
+                region,
+                bucket,
+                access_key_id,
+                access_key_secret,
+                ..
+            } => (endpoint, region, bucket, access_key_id, access_key_secret),
+            #[cfg(test)]
+            StorageConfig::Local { .. } => {
+                return Err(ApiError::unavailable("Office 在线预览需要 OSS 原文件"))
+            }
+        };
+        let object_key = self.remote_key(key);
+        let mut url = object_url(endpoint, bucket, &object_key);
+        if url.scheme() != "https" {
+            return Err(ApiError::unavailable("Office 在线预览需要 HTTPS OSS 端点"));
+        }
+        let timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.format("%Y%m%d").to_string();
+        let scope = format!("{date}/{region}/oss/aliyun_v4_request");
+        let host = url.host_str().ok_or_else(ApiError::internal)?;
+        let host = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let parameters = std::collections::BTreeMap::from([
+            ("response-content-disposition", "inline".to_owned()),
+            ("x-oss-additional-headers", "host".to_owned()),
+            ("x-oss-credential", format!("{access_key_id}/{scope}")),
+            ("x-oss-date", timestamp.clone()),
+            ("x-oss-expires", "600".to_owned()),
+            ("x-oss-signature-version", "OSS4-HMAC-SHA256".to_owned()),
+        ]);
+        let query = parameters
+            .iter()
+            .map(|(name, value)| format!("{name}={}", oss_query_encode(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical =
+            format!("GET\n/{bucket}/{object_key}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+        let string_to_sign = format!(
+            "OSS4-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+            hex_sha256(canonical.as_bytes())
+        );
+        let date_key = hmac_sha256(format!("aliyun_v4{access_key_secret}").as_bytes(), &date);
+        let region_key = hmac_sha256(&date_key, region);
+        let service_key = hmac_sha256(&region_key, "oss");
+        let signing_key = hmac_sha256(&service_key, "aliyun_v4_request");
+        let signature = hex_bytes(&hmac_sha256(&signing_key, &string_to_sign));
+        url.set_query(Some(&format!("{query}&x-oss-signature={signature}")));
+        Ok(url.to_string())
+    }
+
     /// Serve authorized media straight from OSS, including video byte ranges.
     /// No object URL or credential is exposed, and no preview is persisted locally.
     pub async fn media_response(
@@ -581,6 +652,19 @@ fn hex_sha256(value: &[u8]) -> String {
     hex_bytes(&Sha256::digest(value))
 }
 
+fn oss_query_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
 fn hex_bytes(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -686,6 +770,39 @@ mod tests {
             .unwrap();
         assert_eq!(request.headers().get(header::AUTHORIZATION).unwrap(),
             "OSS4-HMAC-SHA256 Credential=test-ak/20250411/cn-beijing/oss/aliyun_v4_request,AdditionalHeaders=host,Signature=6c73dd687d57196f277e9ab11ad08fc767960447b79094b178109754ee78c0e9");
+    }
+
+    #[test]
+    fn office_url_signs_only_one_workbook_for_ten_minutes() {
+        let now = chrono::DateTime::parse_from_rfc3339("2025-04-11T09:27:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let url =
+            Url::parse(&oss_store().office_read_url_at("preview.xlsx", now).unwrap()).unwrap();
+        assert_eq!(
+            url.host_str(),
+            Some("futuredev.oss-cn-beijing.aliyuncs.com")
+        );
+        assert_eq!(url.path(), "/knowledge/doc/preview.xlsx");
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query["x-oss-expires"], "600");
+        assert_eq!(query["response-content-disposition"], "inline");
+        // Independently calculated with Python hashlib/hmac and urllib.quote.
+        assert_eq!(
+            query["x-oss-signature"],
+            "113bf4f8e1d3ebff763cbcdde923a61ca004d25da92eb6aca5f17406003b7d20"
+        );
+        assert!(!url.as_str().contains("test-sk"));
+        for key in [
+            "question-private.xlsx",
+            "picture.png",
+            "../file.xlsx",
+            "https://other.test/a.xlsx",
+        ] {
+            assert!(oss_store().office_read_url(key).is_err());
+        }
     }
 
     #[test]

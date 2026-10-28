@@ -43,6 +43,10 @@ pub fn router() -> Router<AppState> {
             post(access_ticket),
         )
         .route(
+            "/kb-api/v1/knowledge/assets/{asset_id}/office-preview",
+            post(office_preview),
+        )
+        .route(
             "/kb-api/v1/admin/knowledge/assets/{asset_id}/preview-ticket",
             post(preview_ticket),
         )
@@ -102,6 +106,10 @@ fn safe_mime(value: &str) -> &'static str {
         "video/quicktime" => "video/quicktime",
         "video/x-msvideo" => "video/x-msvideo",
         "application/pdf" => "application/pdf",
+        "application/vnd.ms-excel" => "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        }
         _ => "application/octet-stream",
     }
 }
@@ -341,6 +349,35 @@ async fn access_ticket(
     )
     .await?;
     Ok(Json(json!({"url":path,"expiresIn":TICKET_TTL_SECONDS})))
+}
+
+async fn office_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+    input: Option<Json<AccessTicketInput>>,
+) -> Result<Json<Value>, ApiError> {
+    // Reuse exactly the same identity, course-permission and publication
+    // checks as other student media; the browser never supplies an OSS key.
+    let Json(media) = access_ticket(State(state.clone()), headers, Path(asset_id), input).await?;
+    let ticket = media["url"]
+        .as_str()
+        .and_then(|url| url.strip_prefix(MEDIA_PATH))
+        .ok_or_else(ApiError::internal)?;
+    Ok(Json(office_link(&state, ticket).await?))
+}
+
+async fn office_link(state: &AppState, ticket: &str) -> Result<Value, ApiError> {
+    let (key, mime) = authorized_media(state, ticket).await?;
+    if !matches!(
+        mime.as_str(),
+        "application/vnd.ms-excel"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ) {
+        return Err(ApiError::bad_request("仅支持 Excel 工作表在线预览"));
+    }
+    let url = state.storage.office_read_url(&key)?;
+    Ok(json!({"url":url,"expiresIn":600}))
 }
 
 #[derive(Deserialize)]
@@ -711,6 +748,68 @@ mod tests {
         )
         .await
         .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn office_preview_reuses_publication_checks_and_never_accepts_arbitrary_sources() {
+        let (mut state, _) = fixture().await;
+        assert_eq!(
+            office_preview(
+                State(state.clone()),
+                HeaderMap::new(),
+                Path("asset".into()),
+                None
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::UNAUTHORIZED
+        );
+        state.storage = crate::storage::BlobStore::new(crate::config::StorageConfig::Oss {
+            local_dir: std::path::PathBuf::from("data/test-cache"),
+            endpoint: Box::new("https://oss-cn-beijing.aliyuncs.com".parse().unwrap()),
+            region: "cn-beijing".into(),
+            bucket: "futuredev".into(),
+            access_key_id: "test-ak".into(),
+            access_key_secret: "test-sk".into(),
+            prefix: "knowledge/".into(),
+        });
+        let key = format!("{}.xlsx", Uuid::new_v4());
+        let mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        sqlx::query("UPDATE kb_assets SET asset_type='spreadsheet',storage_key=?,mime_type=? WHERE asset_id='asset'").bind(&key).bind(mime).execute(&state.db).await.unwrap();
+        let path = issue(&state, "student", "asset", "revision", &key, mime)
+            .await
+            .unwrap();
+        let ticket = path.strip_prefix(MEDIA_PATH).unwrap();
+        let link = office_link(&state, ticket).await.unwrap();
+        assert!(link["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://futuredev.oss-cn-beijing.aliyuncs.com/knowledge/doc/"));
+        assert_eq!(link["expiresIn"], 600);
+        assert!(office_link(&state, "https://other.test/secret.xlsx")
+            .await
+            .is_err());
+        sqlx::query("UPDATE kb_assets SET published_revision_id=NULL")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            office_link(&state, ticket).await.unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
+        sqlx::query("UPDATE kb_assets SET published_revision_id='revision'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kb_media_tickets SET expires_at=0")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            office_link(&state, ticket).await.unwrap_err().status,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

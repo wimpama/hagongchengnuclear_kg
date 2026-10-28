@@ -45,7 +45,11 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/kb-api/v1/admin/knowledge/assets/{asset_id}/parts",
-            get(get_parts),
+            get(get_parts).put(save_parts),
+        )
+        .route(
+            "/kb-api/v1/admin/knowledge/assets/{asset_id}/media-metadata",
+            get(get_media_metadata),
         )
         .route(
             "/kb-api/v1/admin/knowledge/assets/{asset_id}/text",
@@ -100,6 +104,7 @@ pub struct AssetView {
     pub index_job_state: Option<String>,
     pub index_progress: Option<Value>,
     pub created_at: String,
+    pub evidence_mode: String,
 }
 
 fn asset_from_row(row: &sqlx::sqlite::SqliteRow) -> AssetView {
@@ -145,6 +150,7 @@ fn asset_from_row(row: &sqlx::sqlite::SqliteRow) -> AssetView {
                 "stage":if state == "succeeded" { "complete".to_owned() } else { row.try_get::<Option<String>, _>("progress_stage").ok().flatten().unwrap_or(state) }})
         }),
         created_at: row.get("created_at"),
+        evidence_mode: row.get("evidence_mode"),
     }
 }
 
@@ -230,6 +236,7 @@ async fn upload_asset(
     let mut title: Option<String> = None;
     let mut description: Option<String> = None;
     let mut subtitle: Option<String> = None;
+    let mut evidence_mode: Option<String> = None;
     let mut seen_fields = std::collections::HashSet::new();
     while let Some(mut field) = multipart
         .next_field()
@@ -239,12 +246,15 @@ async fn upload_asset(
         let field_name = field.name().map(str::to_owned).unwrap_or_default();
         if !matches!(
             field_name.as_str(),
-            "file" | "title" | "description" | "subtitle"
+            "file" | "title" | "description" | "subtitle" | "evidenceMode"
         ) || !seen_fields.insert(field_name.clone())
         {
             return Err(ApiError::bad_request("上传表单包含重复或未知字段"));
         }
-        if matches!(field_name.as_str(), "title" | "description" | "subtitle") {
+        if matches!(
+            field_name.as_str(),
+            "title" | "description" | "subtitle" | "evidenceMode"
+        ) {
             if field.file_name().is_some() {
                 return Err(ApiError::bad_request("标题、说明和字幕应以 UTF-8 文本提交"));
             }
@@ -280,6 +290,7 @@ async fn upload_asset(
                 "title" => title = Some(value),
                 "description" => description = Some(value),
                 "subtitle" => subtitle = Some(value),
+                "evidenceMode" => evidence_mode = Some(value),
                 _ => unreachable!(),
             }
             continue;
@@ -373,6 +384,7 @@ async fn upload_asset(
             title,
             description,
             subtitle,
+            evidence_mode,
         },
         None,
     )
@@ -387,6 +399,7 @@ struct CoursewareImportRequest {
     title: Option<String>,
     description: Option<String>,
     subtitle: Option<String>,
+    evidence_mode: Option<String>,
 }
 
 async fn import_courseware(
@@ -400,6 +413,7 @@ async fn import_courseware(
         title: request.title,
         description: request.description,
         subtitle: request.subtitle,
+        evidence_mode: request.evidence_mode,
     }
     .normalized()?;
     let source =
@@ -504,6 +518,7 @@ struct UploadFields {
     title: Option<String>,
     description: Option<String>,
     subtitle: Option<String>,
+    evidence_mode: Option<String>,
 }
 
 impl UploadFields {
@@ -522,6 +537,7 @@ impl UploadFields {
             title: field(self.title, 1024)?,
             description: field(self.description, MAX_TEXT_BYTES)?,
             subtitle: field(self.subtitle, MAX_TEXT_BYTES)?,
+            evidence_mode: field(self.evidence_mode, 40)?,
         })
     }
 }
@@ -538,7 +554,17 @@ async fn finish_asset(
         title,
         description,
         subtitle,
+        evidence_mode,
     } = fields.normalized()?;
+    let spreadsheet = stored.kind == "spreadsheet";
+    let evidence_mode =
+        evidence_mode
+            .as_deref()
+            .unwrap_or(if spreadsheet { "file" } else { "content" });
+    if !matches!(evidence_mode, "file" | "content") || (!spreadsheet && evidence_mode != "content")
+    {
+        return Err(ApiError::bad_request("仅 Excel 支持直接证据或文本证据模式"));
+    }
     let description = description.as_deref().filter(|value| !value.is_empty());
     let subtitle = subtitle.as_deref().filter(|value| !value.is_empty());
     if subtitle.is_some() && !matches!(stored.kind, "audio" | "video") {
@@ -553,6 +579,15 @@ async fn finish_asset(
         .map(parse_subtitles)
         .transpose()?
         .unwrap_or_default();
+    let duration_ms = if matches!(stored.kind, "video" | "audio") {
+        let duration = crate::media::probe_duration(&stored.path, stored.kind).await?;
+        for cue in &subtitle_cues {
+            validate_source_range(cue.start_ms.zip(cue.end_ms), Some(duration))?;
+        }
+        Some(duration)
+    } else {
+        None
+    };
     let mut document_message = String::new();
     let mut prepared_document = None;
     let extracted = if stored.kind == "text" {
@@ -587,6 +622,14 @@ async fn finish_asset(
             page: None,
             image_key: None,
         }]
+    } else if spreadsheet && evidence_mode == "content" {
+        let parsed = crate::extract::extract_spreadsheet(
+            &stored.path,
+            stored.storage_key.ends_with(".xlsx"),
+        )
+        .await?;
+        document_message = parsed.message;
+        parsed.pages
     } else if stored.kind == "document" {
         let mut parsed =
             crate::document_visuals::prepare(&state.storage, &stored.storage_key, &stored.mime)
@@ -630,6 +673,11 @@ async fn finish_asset(
     }
     sqlx::query("INSERT INTO kb_assets(asset_id,node_id,asset_type,original_name,storage_key,byte_size,mime_type,created_by) VALUES(?,?,?,?,?,?,?,?)")
         .bind(&asset_id).bind(node_id).bind(stored.kind).bind(display_name).bind(&stored.storage_key).bind(stored.size as i64).bind(&stored.mime).bind(&user.id).execute(&mut *tx).await?;
+    sqlx::query("UPDATE kb_assets SET evidence_mode=? WHERE asset_id=?")
+        .bind(evidence_mode)
+        .bind(&asset_id)
+        .execute(&mut *tx)
+        .await?;
     let mut extraction = upload_extraction(
         stored.kind,
         &stored.name,
@@ -638,6 +686,9 @@ async fn finish_asset(
         !subtitle_cues.is_empty(),
         &document_message,
     );
+    if let Some(duration) = duration_ms {
+        extraction["sourceDurationMs"] = json!(duration);
+    }
     let visual_pages = extracted.iter().filter(|p| p.image_key.is_some()).count();
     if visual_pages > 0 {
         extraction["extractionMode"] = json!("page_text_image_v1");
@@ -647,6 +698,15 @@ async fn finish_asset(
     if let Some(id) = source_courseware_id.as_deref() {
         extraction["sourceCoursewareId"] = json!(id);
         extraction["sourceType"] = json!("courseware_snapshot");
+    }
+    if spreadsheet {
+        extraction["evidenceMode"] = json!(evidence_mode);
+        extraction["state"] = json!("review_required");
+        extraction["message"] = json!(if evidence_mode == "file" {
+            "原表格已保存，仅名称和教师说明用于查找；不向量化表格内容。审核后可直接发布，学生可在页面内预览原表格。"
+        } else {
+            &document_message
+        });
     }
     insert_revision(
         &mut tx,
@@ -668,6 +728,14 @@ async fn finish_asset(
         &subtitle_cues,
     )
     .await?;
+    if spreadsheet {
+        if evidence_mode == "file" {
+            insert_part(&mut tx, &revision_id, 0, "text", Some(&format!("表格资源：{}\n{}", stored.name, description.unwrap_or("教师提供的 Excel 原文件，可在页面内查看；文件内容未解析，不据此推断公式或数据。"))), Some(&stored.storage_key), None, None, None,
+                &json!({"source":"teacher_description","spreadsheet":true,"resourceOnly":true})).await?;
+        } else {
+            mark_spreadsheet_parts(&mut tx, &revision_id, &stored.storage_key, false).await?;
+        }
+    }
     audit(
         &mut tx,
         &user.id,
@@ -682,6 +750,31 @@ async fn finish_asset(
         document.retain();
     }
     load_asset(&state.db, &asset_id).await
+}
+
+async fn mark_spreadsheet_parts(
+    tx: &mut Transaction<'_, Sqlite>,
+    revision: &str,
+    key: &str,
+    resource_only: bool,
+) -> Result<(), ApiError> {
+    let rows = sqlx::query("SELECT * FROM kb_content_parts WHERE revision_id=?")
+        .bind(revision)
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        let mut metadata: Value = row
+            .get::<Option<String>, _>("metadata_json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(json!({}));
+        metadata["spreadsheet"] = json!(true);
+        metadata["resourceOnly"] = json!(resource_only);
+        let text: Option<String> = row.get("content_text");
+        let hash = hash_content(text.as_deref(), Some(key), None, None, &metadata);
+        sqlx::query("UPDATE kb_content_parts SET media_storage_key=?,metadata_json=?,content_sha256=? WHERE part_id=?")
+            .bind(key).bind(metadata.to_string()).bind(hash).bind(row.get::<String,_>("part_id")).execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 fn upload_extraction(
@@ -726,6 +819,9 @@ async fn insert_upload_parts(
     subtitles: &[SubtitleCue],
 ) -> Result<(), ApiError> {
     let mut index = 0;
+    if kind == "spreadsheet" && extracted.is_empty() {
+        return Ok(());
+    }
     for page in extracted {
         // Store one JPEG per page. Every text chunk is paired with that exact
         // page image, so dense pages retain precise recall and a correction
@@ -1037,6 +1133,218 @@ pub struct PartView {
     pub evidence_status: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PartsChange {
+    revision_id: String,
+    parts: Vec<PartChange>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartChange {
+    id: Option<String>,
+    modality: Option<String>,
+    text: String,
+    start_seconds: Option<f64>,
+    end_seconds: Option<f64>,
+}
+
+async fn save_parts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+    Json(change): Json<PartsChange>,
+) -> Result<Json<AssetView>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    save_parts_checked(&state, &asset_id, &user.id, change).await?;
+    Ok(Json(load_asset(&state.db, &asset_id).await?))
+}
+
+pub(crate) async fn save_parts_checked(
+    state: &AppState,
+    asset_id: &str,
+    actor: &str,
+    change: PartsChange,
+) -> Result<(), ApiError> {
+    // Reject malformed input before any OSS download or metadata probing.
+    for part in &change.parts {
+        time_range(&TextChange {
+            text: String::new(),
+            start_seconds: part.start_seconds,
+            end_seconds: part.end_seconds,
+        })?;
+    }
+    let duration = if change.parts.iter().any(|p| p.start_seconds.is_some()) {
+        Some(source_media_duration(state, asset_id).await?)
+    } else {
+        None
+    };
+    // An active indexing task must produce a bounded, retryable response,
+    // rather than leaving a teacher's request queued behind external I/O.
+    let _guard = state.workflow_lock.try_lock().map_err(|_| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "knowledge_workflow_busy",
+            "知识库正在处理索引任务，请稍后重试；本次修改尚未保存",
+        )
+    })?;
+    save_parts_revision(&state.db, asset_id, actor, change, duration).await
+}
+
+async fn save_parts_revision(
+    db: &SqlitePool,
+    asset_id: &str,
+    actor: &str,
+    change: PartsChange,
+    duration_ms: Option<i64>,
+) -> Result<(), ApiError> {
+    if change.parts.is_empty() || change.parts.len() > 2000 {
+        return Err(ApiError::bad_request("请保留 1 至 2000 个片段"));
+    }
+    let asset = load_asset(db, asset_id).await?;
+    if asset.revision_id.as_deref() != Some(&change.revision_id) {
+        return Err(ApiError::bad_request("资料已更新，请重新打开后编辑"));
+    }
+    if matches!(asset.index_job_state.as_deref(), Some("queued" | "running")) {
+        return Err(ApiError::bad_request("正在索引，请等待完成后编辑"));
+    }
+    if asset
+        .extraction
+        .as_ref()
+        .is_some_and(|extraction| extraction["reviewProgress"]["state"].as_str() == Some("running"))
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "review_busy",
+            "资料正在审核处理，请等待完成后编辑",
+        ));
+    }
+    let mut tx = db.begin().await?;
+    let source = sqlx::query("SELECT asset_type,storage_key FROM kb_assets WHERE asset_id=?")
+        .bind(asset_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let kind: String = source.get("asset_type");
+    let source_key: String = source.get("storage_key");
+    let rows =
+        sqlx::query("SELECT * FROM kb_content_parts WHERE revision_id=? ORDER BY part_index")
+            .bind(&change.revision_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let (revision, _) = next_revision(&mut tx, asset_id, Some(&change.revision_id), actor).await?;
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    for (index, part) in change.parts.iter().enumerate() {
+        bytes = bytes.saturating_add(part.text.len());
+        if bytes > MAX_TEXT_BYTES || part.text.contains('\0') {
+            return Err(ApiError::bad_request(
+                "片段正文合计不得超过 10MB，且不能包含二进制数据",
+            ));
+        }
+        let range = time_range(&TextChange {
+            text: String::new(),
+            start_seconds: part.start_seconds,
+            end_seconds: part.end_seconds,
+        })?;
+        if range.is_some() && !matches!(kind.as_str(), "video" | "audio") {
+            return Err(ApiError::bad_request("仅视频和音频可以设置时间范围"));
+        }
+        validate_source_range(range, duration_ms)?;
+        let original = match &part.id {
+            Some(id) => {
+                if !seen.insert(id) {
+                    return Err(ApiError::bad_request("片段不可重复"));
+                }
+                Some(
+                    rows.iter()
+                        .find(|row| row.get::<String, _>("part_id") == *id)
+                        .ok_or_else(|| ApiError::bad_request("片段不属于当前资料版本"))?,
+                )
+            }
+            None => None,
+        };
+        let mut metadata: Value = original
+            .and_then(|r| r.get::<Option<String>, _>("metadata_json"))
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or(json!({}));
+        let mut modality = original
+            .map(|r| r.get::<String, _>("modality"))
+            .unwrap_or_else(|| "text".into());
+        let requested = part.modality.as_deref().unwrap_or(&modality).to_owned();
+        if !matches!(requested.as_str(), "text" | "image" | "video" | "audio")
+            || (requested != "text" && requested != kind && original.is_none())
+        {
+            return Err(ApiError::bad_request(
+                "片段类型必须是文字或当前原件的媒体类型",
+            ));
+        }
+        if original.is_some() && requested != modality {
+            return Err(ApiError::bad_request("已有媒体片段请删除后以新类型添加"));
+        }
+        modality = requested;
+        let mut media: Option<String> = original.and_then(|r| r.get("media_storage_key"));
+        let old_range = original.map(|r| {
+            (
+                r.get::<Option<i64>, _>("start_ms"),
+                r.get::<Option<i64>, _>("end_ms"),
+            )
+        });
+        let times = (range.map(|r| r.0), range.map(|r| r.1));
+        if modality == "video" && (original.is_none() || old_range != Some(times)) {
+            // A prepared derivative is rebased to zero. Changed source times
+            // must be cut again from the original, never just relabelled.
+            modality = "video".into();
+            media = Some(source_key.clone());
+            metadata = json!({"source":"teacher_segment", "audioUnderstood":false, "customTimeRange":range.is_some()});
+        } else if original.is_none() && matches!(modality.as_str(), "image" | "audio") {
+            media = Some(source_key.clone());
+        } else if original.is_none() && kind == "video" && range.is_some() {
+            // A timestamped text explanation links to the original video,
+            // without claiming to be a visual embedding of that segment.
+            media = Some(source_key.clone());
+        }
+        let text = part.text.trim();
+        if kind == "spreadsheet" {
+            media = Some(source_key.clone());
+            metadata["spreadsheet"] = json!(true);
+            metadata["resourceOnly"] = json!(asset.evidence_mode == "file");
+        }
+        if text.is_empty() && !matches!(modality.as_str(), "image" | "video") {
+            return Err(ApiError::bad_request(format!(
+                "片段 {} 需要填写正文，或删除此片段",
+                index + 1
+            )));
+        }
+        metadata["source"] = json!("teacher_text");
+        metadata["needsDescription"] = json!(false);
+        insert_part(
+            &mut tx,
+            &revision,
+            index,
+            &modality,
+            (!text.is_empty()).then_some(text),
+            media.as_deref(),
+            original.and_then(|r| r.get("page_number")),
+            times.0,
+            times.1,
+            &metadata,
+        )
+        .await?;
+    }
+    audit(
+        &mut tx,
+        actor,
+        "asset.parts_revision",
+        asset_id,
+        json!({"revisionId":revision,"partCount":change.parts.len()}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 fn part_from_row(row: &sqlx::sqlite::SqliteRow) -> PartView {
     PartView {
         id: row.get("part_id"),
@@ -1094,12 +1402,86 @@ fn time_range(change: &TextChange) -> Result<Option<(i64, i64)>, ApiError> {
                 && end > start
                 && end <= 31_536_000.0 =>
         {
-            Ok(Some(((start * 1000.0) as i64, (end * 1000.0) as i64)))
+            let start_ms = (start * 1000.0).round() as i64;
+            let end_ms = (end * 1000.0).round() as i64;
+            if end_ms <= start_ms {
+                return Err(ApiError::bad_request("时间范围至少需要 1 毫秒"));
+            }
+            Ok(Some((start_ms, end_ms)))
         }
         _ => Err(ApiError::bad_request(
-            "时间段应同时包含有效起止秒数，且结束时间晚于开始时间",
+            "请同时填写有效的起止时间；开始时间不得小于 0，结束时间必须晚于开始时间。全部留空表示完整媒体",
         )),
     }
+}
+
+fn validate_source_range(
+    range: Option<(i64, i64)>,
+    duration_ms: Option<i64>,
+) -> Result<(), ApiError> {
+    let Some((start, end)) = range else {
+        return Ok(());
+    };
+    let duration = duration_ms
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| ApiError::bad_request("无法确认原件时长，请重新加载原件后重试"))?;
+    if start < 0 || end <= start || end > duration {
+        return Err(ApiError::bad_request(format!(
+            "片段时间范围必须在原件 0 至 {:.3} 秒之内，且结束时间晚于开始时间",
+            duration as f64 / 1000.0
+        )));
+    }
+    Ok(())
+}
+
+/// Enrich parser metadata for old uploads on demand. The original is immutable,
+/// so this trusted duration remains valid across every content revision.
+async fn source_media_duration(state: &AppState, asset_id: &str) -> Result<i64, ApiError> {
+    load_asset(&state.db, asset_id).await?;
+    let source = sqlx::query(
+        "SELECT a.asset_type,a.storage_key,r.revision_id,r.extraction_json FROM kb_assets a
+         JOIN kb_asset_revisions r ON r.asset_id=a.asset_id
+         WHERE a.asset_id=? AND a.deleted_at IS NULL ORDER BY r.revision_number LIMIT 1",
+    )
+    .bind(asset_id)
+    .fetch_one(&state.db)
+    .await?;
+    let kind: String = source.get("asset_type");
+    if !matches!(kind.as_str(), "video" | "audio") {
+        return Err(ApiError::bad_request("仅视频和音频可以设置时间范围"));
+    }
+    let extraction: Value = source
+        .get::<Option<String>, _>("extraction_json")
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .filter(Value::is_object)
+        .unwrap_or(json!({}));
+    if let Some(duration) = extraction["sourceDurationMs"].as_i64().filter(|v| *v > 0) {
+        return Ok(duration);
+    }
+    let key: String = source.get("storage_key");
+    // Do not hold a database transaction or the workflow lock across OSS I/O.
+    let duration = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let input = state.storage.ensure_local(&key).await?;
+        crate::media::probe_duration(&input, &kind).await
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("读取原件时长超时，请重新加载后重试"))??;
+    sqlx::query("UPDATE kb_asset_revisions SET extraction_json=json_set(COALESCE(extraction_json,'{}'),'$.sourceDurationMs',?) WHERE revision_id=?")
+        .bind(duration)
+        .bind(source.get::<String, _>("revision_id"))
+        .execute(&state.db)
+        .await?;
+    Ok(duration)
+}
+
+async fn get_media_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(asset_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let duration = source_media_duration(&state, &asset_id).await?;
+    Ok(Json(json!({"durationSeconds": duration as f64 / 1000.0})))
 }
 
 fn validate_text(text: &str) -> Result<&str, ApiError> {
@@ -1122,15 +1504,27 @@ async fn replace_asset_text(
     let text = validate_text(&change.text)?;
     let range = time_range(&change)?;
     let asset = load_asset(&state.db, &asset_id).await?;
-    let mut tx = state.db.begin().await?;
-    let (revision_id, _) =
-        next_revision(&mut tx, &asset_id, asset.revision_id.as_deref(), &user.id).await?;
     let source = sqlx::query("SELECT asset_type,storage_key FROM kb_assets WHERE asset_id=?")
         .bind(&asset_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&state.db)
         .await?;
     let source_type: String = source.get("asset_type");
     let source_key: String = source.get("storage_key");
+    let cues = if matches!(source_type.as_str(), "video" | "audio") {
+        parse_subtitles(text)?
+    } else {
+        vec![]
+    };
+    if range.is_some() || cues.iter().any(|cue| cue.start_ms.is_some()) {
+        let duration = source_media_duration(&state, &asset_id).await?;
+        validate_source_range(range, Some(duration))?;
+        for cue in &cues {
+            validate_source_range(cue.start_ms.zip(cue.end_ms), Some(duration))?;
+        }
+    }
+    let mut tx = state.db.begin().await?;
+    let (revision_id, _) =
+        next_revision(&mut tx, &asset_id, asset.revision_id.as_deref(), &user.id).await?;
     replace_revision_content(
         &mut tx,
         &revision_id,
@@ -1141,6 +1535,15 @@ async fn replace_asset_text(
         range,
     )
     .await?;
+    if source_type == "spreadsheet" {
+        mark_spreadsheet_parts(
+            &mut tx,
+            &revision_id,
+            &source_key,
+            asset.evidence_mode == "file",
+        )
+        .await?;
+    }
     audit(
         &mut tx,
         &user.id,
@@ -1295,6 +1698,10 @@ async fn update_part(
         return Err(ApiError::bad_request(
             "资料已生成新版，请刷新后编辑最新片段",
         ));
+    }
+    if range.is_some() {
+        let duration = source_media_duration(&state, &asset_id).await?;
+        validate_source_range(range, Some(duration))?;
     }
     let mut tx = state.db.begin().await?;
     let (revision_id, _) = next_revision(&mut tx, &asset_id, Some(&previous), &user.id).await?;
@@ -1481,6 +1888,11 @@ pub(crate) fn file_type(ext: &str) -> Option<(&'static str, &'static str)> {
         "txt" => ("text", "text/plain"),
         "md" => ("text", "text/markdown"),
         "csv" => ("text", "text/csv"),
+        "xlsx" => (
+            "spreadsheet",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        "xls" => ("spreadsheet", "application/vnd.ms-excel"),
         "html" | "htm" => ("text", "text/html"),
         "pdf" => ("document", "application/pdf"),
         "docx" => (
@@ -1512,7 +1924,7 @@ pub(crate) fn mime_matches(ext: &str, supplied: &str, canonical: &str) -> bool {
         || (matches!(ext, "txt" | "md" | "csv") && supplied == "text/plain")
         || (ext == "wav" && supplied == "audio/x-wav")
         || (ext == "avi" && supplied == "video/avi")
-        || (matches!(ext, "docx" | "pptx") && supplied == "application/zip")
+        || (matches!(ext, "docx" | "pptx" | "xlsx") && supplied == "application/zip")
 }
 
 pub(crate) fn magic_matches(ext: &str, bytes: &[u8]) -> bool {
@@ -1521,7 +1933,8 @@ pub(crate) fn magic_matches(ext: &str, bytes: &[u8]) -> bool {
         "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
         "webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
         "pdf" => bytes.starts_with(b"%PDF-"),
-        "docx" | "pptx" => bytes.starts_with(b"PK\x03\x04"),
+        "docx" | "pptx" | "xlsx" => bytes.starts_with(b"PK\x03\x04"),
+        "xls" => bytes.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
         "mp4" | "mov" | "m4a" => bytes.get(4..8) == Some(b"ftyp"),
         "avi" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"AVI "),
         "wav" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE"),
@@ -1539,10 +1952,64 @@ pub(crate) fn magic_matches(ext: &str, bytes: &[u8]) -> bool {
 /// UTF-8-safe bounded chunks with overlap; retained text is always source text.
 pub fn split_text(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
+    let mut formulas = Vec::new();
+    let mut cursor = 0;
+    while cursor < chars.len() {
+        let escaped = cursor > 0
+            && chars[..cursor]
+                .iter()
+                .rev()
+                .take_while(|c| **c == '\\')
+                .count()
+                % 2
+                == 1;
+        let delimiter = if !escaped && chars[cursor..].starts_with(&['\\', '(']) {
+            Some((2, vec!['\\', ')']))
+        } else if !escaped && chars[cursor..].starts_with(&['\\', '[']) {
+            Some((2, vec!['\\', ']']))
+        } else if !escaped && chars[cursor..].starts_with(&['$', '$']) {
+            Some((2, vec!['$', '$']))
+        } else if !escaped && chars[cursor] == '$' {
+            Some((1, vec!['$']))
+        } else {
+            None
+        };
+        if let Some((width, close)) = delimiter {
+            let mut end = cursor + width;
+            while end < chars.len() {
+                if chars[end..].starts_with(&close)
+                    && (end == 0
+                        || chars[..end]
+                            .iter()
+                            .rev()
+                            .take_while(|c| **c == '\\')
+                            .count()
+                            % 2
+                            == 0)
+                {
+                    end += close.len();
+                    formulas.push((cursor, end));
+                    break;
+                }
+                end += 1;
+            }
+            if end <= chars.len() && formulas.last().is_some_and(|p| p.0 == cursor) {
+                cursor = end;
+                continue;
+            }
+        }
+        cursor += 1;
+    }
     let mut result = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        let end = (start + 700).min(chars.len());
+        let mut end = (start + 700).min(chars.len());
+        if let Some((_, finish)) = formulas
+            .iter()
+            .find(|(begin, finish)| *begin < end && end < *finish)
+        {
+            end = *finish;
+        }
         let part: String = chars[start..end].iter().collect();
         if !part.trim().is_empty() {
             result.push(part);
@@ -1550,7 +2017,14 @@ pub fn split_text(text: &str) -> Vec<String> {
         if end == chars.len() {
             break;
         }
-        start = end - 80;
+        let mut next = end.saturating_sub(80);
+        if let Some((begin, _)) = formulas
+            .iter()
+            .find(|(begin, finish)| *begin < next && next < *finish)
+        {
+            next = *begin;
+        }
+        start = if next > start { next } else { end };
     }
     result
 }
@@ -1670,6 +2144,268 @@ fn html_text(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_ranges_reject_invalid_or_out_of_bounds_times() {
+        for (start, end) in [
+            (Some(-1.), Some(5.)),
+            (Some(5.), Some(5.)),
+            (Some(10.), Some(5.)),
+            (Some(0.), None),
+            (None, Some(10.)),
+            (Some(f64::NAN), Some(10.)),
+            (Some(0.), Some(f64::INFINITY)),
+            (Some(1.0001), Some(1.0002)),
+        ] {
+            assert!(time_range(&TextChange {
+                text: String::new(),
+                start_seconds: start,
+                end_seconds: end,
+            })
+            .is_err());
+        }
+        assert!(validate_source_range(Some((0, 112_384)), Some(112_384)).is_ok());
+        assert!(validate_source_range(Some((0, 112_385)), Some(112_384)).is_err());
+        assert!(validate_source_range(Some((0, 1)), None).is_err());
+        assert!(validate_source_range(None, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_video_is_allowed_for_new_parts_and_clears_prepared_clips() {
+        let (state, _) = crate::db::test_published_state().await;
+        sqlx::query("UPDATE kb_assets SET asset_type='video',mime_type='video/mp4',storage_key='original.mp4' WHERE asset_id='a'").execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE kb_content_parts SET modality='video',media_storage_key='clip.mp4',start_ms=10000,end_ms=20000,metadata_json=? WHERE part_id='p'")
+            .bind(json!({"videoPrepared":true,"frameStorageKey":"clip.jpg","sourceStorageKey":"original.mp4"}).to_string()).execute(&state.db).await.unwrap();
+        save_parts_checked(
+            &state,
+            "a",
+            "admin",
+            PartsChange {
+                revision_id: "r".into(),
+                parts: vec![Some("p".to_owned()), None]
+                    .into_iter()
+                    .map(|id| PartChange {
+                        id,
+                        modality: Some("video".into()),
+                        text: String::new(),
+                        start_seconds: None,
+                        end_seconds: None,
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+        let asset = load_asset(&state.db, "a").await.unwrap();
+        let rows = sqlx::query("SELECT * FROM kb_content_parts WHERE revision_id=?")
+            .bind(asset.revision_id)
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.get::<String, _>("media_storage_key"), "original.mp4");
+            assert_eq!(row.get::<Option<i64>, _>("start_ms"), None);
+            assert_eq!(row.get::<Option<i64>, _>("end_ms"), None);
+            let metadata: Value =
+                serde_json::from_str(&row.get::<String, _>("metadata_json")).unwrap();
+            assert!(metadata.get("videoPrepared").is_none());
+            assert!(metadata.get("frameStorageKey").is_none());
+            assert_eq!(metadata["customTimeRange"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_workflow_returns_a_conflict_without_creating_a_revision() {
+        let (state, _) = crate::db::test_published_state().await;
+        let _guard = state.workflow_lock.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            save_parts_checked(
+                &state,
+                "a",
+                "admin",
+                PartsChange {
+                    revision_id: "r".into(),
+                    parts: vec![PartChange {
+                        id: Some("p".into()),
+                        modality: Some("image".into()),
+                        text: "修改".into(),
+                        start_seconds: None,
+                        end_seconds: None,
+                    }],
+                },
+            ),
+        )
+        .await
+        .expect("save must not wait for an indexing job");
+        assert_eq!(result.unwrap_err().status, StatusCode::CONFLICT);
+        assert_eq!(
+            load_asset(&state.db, "a")
+                .await
+                .unwrap()
+                .revision_id
+                .as_deref(),
+            Some("r")
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_original_duration_validates_edits_without_a_local_file() {
+        let (state, _) = crate::db::test_published_state().await;
+        sqlx::query(
+            "UPDATE kb_assets SET asset_type='video',mime_type='video/mp4' WHERE asset_id='a'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE kb_asset_revisions SET extraction_json=? WHERE revision_id='r'")
+            .bind(json!({"sourceDurationMs":112384}).to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let error = save_parts_checked(
+            &state,
+            "a",
+            "admin",
+            PartsChange {
+                revision_id: "r".into(),
+                parts: vec![PartChange {
+                    id: None,
+                    modality: Some("video".into()),
+                    text: String::new(),
+                    start_seconds: Some(0.),
+                    end_seconds: Some(113.),
+                }],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("112.384"));
+        assert_eq!(
+            load_asset(&state.db, "a")
+                .await
+                .unwrap()
+                .revision_id
+                .as_deref(),
+            Some("r")
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_parts_are_atomic_versioned_and_video_ranges_use_the_original() {
+        let (state, _) = crate::db::test_published_state().await;
+        sqlx::query("UPDATE kb_assets SET asset_type='video',mime_type='video/mp4',storage_key='original.mp4' WHERE asset_id='a'").execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE kb_content_parts SET modality='video',media_storage_key='old-clip.mp4',start_ms=0,end_ms=60000,metadata_json=? WHERE part_id='p'")
+            .bind(json!({"videoPrepared":true,"sourceStorageKey":"original.mp4","frameStorageKey":"old-frame.jpg"}).to_string()).execute(&state.db).await.unwrap();
+        let changes = PartsChange {
+            revision_id: "r".into(),
+            parts: vec![
+                PartChange {
+                    id: Some("p".into()),
+                    modality: Some("video".into()),
+                    text: "原视频30至45秒的描述".into(),
+                    start_seconds: Some(30.),
+                    end_seconds: Some(45.),
+                },
+                PartChange {
+                    id: None,
+                    modality: Some("text".into()),
+                    text: "补充 \\(E=mc^2\\)".into(),
+                    start_seconds: None,
+                    end_seconds: None,
+                },
+            ],
+        };
+        save_parts_revision(&state.db, "a", "admin", changes, Some(112_384))
+            .await
+            .unwrap();
+        let asset = load_asset(&state.db, "a").await.unwrap();
+        assert_ne!(asset.revision_id.as_deref(), Some("r"));
+        let row =
+            sqlx::query("SELECT * FROM kb_content_parts WHERE revision_id=? AND part_index=0")
+                .bind(asset.revision_id.as_deref())
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.get::<Option<String>, _>("media_storage_key").as_deref(),
+            Some("original.mp4")
+        );
+        assert_eq!(row.get::<i64, _>("start_ms"), 30000);
+        let metadata: Value = serde_json::from_str(&row.get::<String, _>("metadata_json")).unwrap();
+        assert_eq!(metadata["customTimeRange"], true);
+        assert!(metadata.get("videoPrepared").is_none());
+        let published: String =
+            sqlx::query_scalar("SELECT published_revision_id FROM kb_assets WHERE asset_id='a'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(published, "r");
+        let original: String =
+            sqlx::query_scalar("SELECT content_text FROM kb_content_parts WHERE part_id='p'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(original, "李浩然");
+        let newest = asset.revision_id.unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_asset_revisions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let bad = PartsChange {
+            revision_id: newest.clone(),
+            parts: vec![PartChange {
+                id: Some("p".into()),
+                modality: None,
+                text: "旧版本片段".into(),
+                start_seconds: None,
+                end_seconds: None,
+            }],
+        };
+        assert!(
+            save_parts_revision(&state.db, "a", "admin", bad, Some(112_384))
+                .await
+                .is_err()
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_asset_revisions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        save_parts_revision(
+            &state.db,
+            "a",
+            "admin",
+            PartsChange {
+                revision_id: newest,
+                parts: vec![PartChange {
+                    id: None,
+                    modality: Some("video".into()),
+                    text: "新增十秒片段".into(),
+                    start_seconds: Some(80.),
+                    end_seconds: Some(90.),
+                }],
+            },
+            Some(112_384),
+        )
+        .await
+        .unwrap();
+        let count:i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_content_parts WHERE revision_id=(SELECT revision_id FROM kb_asset_revisions WHERE asset_id='a' ORDER BY revision_number DESC LIMIT 1)").fetch_one(&state.db).await.unwrap();
+        assert_eq!(count, 1); // Deleting the old entries was part of this one revision.
+    }
+
+    #[test]
+    fn chunks_preserve_latex_formulas_at_both_boundaries() {
+        let equation = format!("\\[\\frac{{{}}}{{b}}\\]", "x+".repeat(100));
+        let source = format!("{}{}{}", "前".repeat(650), equation, "后".repeat(900));
+        let parts = split_text(&source);
+        assert!(parts.iter().any(|p| p.contains(&equation)));
+        for part in parts {
+            assert_eq!(part.matches("\\[").count(), part.matches("\\]").count());
+        }
+    }
 
     #[test]
     fn parses_real_srt_vtt_and_rejects_invalid_timecodes() {
@@ -1809,6 +2545,12 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        sqlx::query(
+            "ALTER TABLE kb_assets ADD COLUMN evidence_mode TEXT NOT NULL DEFAULT 'content'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO kb_course_nodes(node_id,course_id,level,title) VALUES('leaf','course',2,'Leaf')").execute(&db).await.unwrap();
         let subtitles = parse_subtitles("1\n00:00:02,000 --> 00:00:04,500\n教师讲解的第一段\n\n2\n00:00:08,000 --> 00:00:10,000\n教师讲解的第二段").unwrap();
         for (asset, kind, description, cues) in [

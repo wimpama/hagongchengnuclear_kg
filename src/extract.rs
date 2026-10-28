@@ -146,6 +146,40 @@ pub async fn extract_document(
     })
 }
 
+pub async fn extract_spreadsheet(path: &Path, xlsx: bool) -> Result<ExtractedDocument, ApiError> {
+    let mut command = python_command();
+    command
+        .args(["-I", "-c", include_str!("../processing/spreadsheet.py")])
+        .arg(path)
+        .arg(if xlsx { "xlsx" } else { "xls" });
+    let output = run_bounded(&mut command, path).await?.ok_or_else(|| {
+        ApiError::unavailable("Excel 文本提取需要 Python 和 processing/requirements.txt 中的依赖")
+    })?;
+    #[derive(Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        pages: Vec<ExtractedPage>,
+        error: Option<String>,
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&output).map_err(|_| ApiError::bad_request("Excel 解析结果无效"))?;
+    if let Some(error) = manifest.error {
+        return Err(if error == "missing_dependency" {
+            ApiError::unavailable("请安装 processing/requirements.txt 中的 Excel 解析依赖")
+        } else {
+            ApiError::bad_request("表格无法解析、已加密或超过 20 万单元格 / 8MB 正文限制，请拆分文件或使用直接证据模式")
+        });
+    }
+    if manifest.pages.is_empty() {
+        return Err(ApiError::bad_request(
+            "表格未提取到可见工作表文字，请使用直接证据模式或补充说明",
+        ));
+    }
+    Ok(ExtractedDocument { pages: manifest.pages, message: if xlsx {
+        "已提取可见工作表文字、公式源码和文件缓存值；不执行公式，不保证缓存值为最新。请核对后发布，学生可在页面内预览原表格。"
+    } else { "已提取 XLS 可见工作表文字和缓存结果；此格式不提取公式源码、不重新计算。请核对后发布。" }.into() })
+}
+
 pub(crate) async fn run_bounded(
     command: &mut Command,
     _source: &Path,

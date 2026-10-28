@@ -41,8 +41,8 @@ pub struct ModelConfig {
     /// so the default intentionally keeps the strict path enabled.
     #[serde(default = "default_answer_verification")]
     pub answer_verification_enabled: bool,
-    /// When verification is disabled, whether to still expose the retrieved
-    /// course evidence to the student as provenance. Retrieval itself is
+    /// When verification is disabled, whether to expose the course evidence
+    /// actually cited by the answer as provenance. Retrieval itself is
     /// always performed regardless of this setting.
     #[serde(default = "default_answer_provenance_enabled")]
     pub answer_provenance_enabled: bool,

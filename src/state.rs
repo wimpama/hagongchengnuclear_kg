@@ -11,6 +11,8 @@ use crate::{auth::AuthUpstream, config::AppConfig, qdrant::QdrantAdapter, storag
 pub struct AppState {
     pub environment: crate::config::Environment,
     pub workflow_lock: Arc<Mutex<()>>,
+    pub review_lock: Arc<Mutex<()>>,
+    pub learning_lock: Arc<Mutex<()>>,
     pub worker_running: Arc<AtomicBool>,
     pub db: SqlitePool,
     pub ai_log_dir: PathBuf,
@@ -31,6 +33,8 @@ impl AppState {
         Self {
             environment: config.environment,
             workflow_lock: Arc::new(Mutex::new(())),
+            review_lock: Arc::new(Mutex::new(())),
+            learning_lock: Arc::new(Mutex::new(())),
             worker_running: Arc::new(AtomicBool::new(false)),
             db,
             ai_log_dir,

@@ -24,6 +24,33 @@ pub struct QdrantHealth {
 }
 
 impl QdrantAdapter {
+    pub async fn learning_query(
+        &self,
+        name: &str,
+        vector: Vec<f32>,
+        filter: Value,
+    ) -> Result<Vec<Value>, ApiError> {
+        let result = self.request(reqwest::Method::POST, &format!("collections/{name}/points/query"),
+            json!({"query":vector,"filter":filter,"limit":80,"score_threshold":0.3,"with_payload":true,"with_vector":false})).await?;
+        result
+            .pointer("/result/points")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| ApiError::unavailable("学生问答索引响应无效"))
+    }
+
+    pub async fn delete_points(&self, name: &str, ids: &[String]) -> Result<(), ApiError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.request(
+            reqwest::Method::POST,
+            &format!("collections/{name}/points/delete?wait=true"),
+            json!({"points":ids}),
+        )
+        .await?;
+        Ok(())
+    }
     async fn request(
         &self,
         method: reqwest::Method,

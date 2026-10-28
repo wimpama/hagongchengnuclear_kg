@@ -338,8 +338,10 @@ pub(crate) async fn published_asset_count(
                JOIN kb_content_parts p ON p.part_id=vr.part_id AND p.revision_id=r.revision_id
                WHERE vr.revision_id=r.revision_id AND vr.collection_id=vc.collection_id
                  AND vr.status='verified' AND vr.dimensions=ec.dimensions)"
-    ).bind(&scope.course_id).bind(nodes).fetch_one(pool).await?;
-    Ok(count)
+    ).bind(&scope.course_id).bind(&nodes).fetch_one(pool).await?;
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kb_assets a JOIN kb_course_nodes n ON n.node_id=a.node_id JOIN kb_asset_revisions r ON r.revision_id=a.published_revision_id WHERE n.course_id=? AND n.node_id IN (SELECT value FROM json_each(?)) AND n.is_active=1 AND a.deleted_at IS NULL AND a.evidence_mode='file' AND r.status='published' AND r.review_status='approved' AND r.index_status='not_required'")
+        .bind(&scope.course_id).bind(&nodes).fetch_one(pool).await?;
+    Ok(count + files)
 }
 
 pub async fn sync(
