@@ -119,7 +119,7 @@ main() {
 
   if [ "$build_images" = yes ]; then
     printf 'Building backend images for %s; current containers keep running...\n' "$revision"
-    compose build qdrant knowledge-service
+    compose --progress "${BUILDKIT_PROGRESS:-plain}" build qdrant knowledge-service
   fi
   printf '%s\n' 'Starting the knowledge services and waiting for readiness...'
   if ! compose up --detach --no-build --wait --wait-timeout 120 qdrant knowledge-service; then

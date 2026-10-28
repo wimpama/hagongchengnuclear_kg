@@ -43,7 +43,9 @@ RUN --mount=type=cache,id=course-knowledge-cargo-registry,target=/usr/local/carg
 FROM node:22.19.0-bookworm-slim AS document-processing
 WORKDIR /opt/knowledge-processing
 COPY processing/package.json processing/package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts
+RUN --mount=type=cache,id=course-knowledge-npm,target=/root/.npm,sharing=locked \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+      --fetch-timeout=120000 --fetch-retries=3
 COPY processing/pptx.mjs ./
 
 FROM debian:bookworm-slim AS runtime
@@ -55,8 +57,24 @@ ENV RUST_LOG=info \
     KB_PYTHON_BIN=/opt/knowledge-python/bin/python3 \
     KB_PPTX_PROCESSOR=/opt/knowledge-processing/pptx.mjs
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl libsqlite3-0 ffmpeg poppler-utils python3 python3-venv fonts-droid-fallback fonts-noto-cjk fonts-liberation \
+ARG KB_APT_MIRROR=aliyun
+# Slim images may not have CA certificates until this install. APT still
+# verifies Debian's signed repository metadata and package checksums over HTTP.
+RUN case "$KB_APT_MIRROR" in \
+      aliyun) \
+        for kb_apt_source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+          if [ -f "$kb_apt_source" ]; then \
+            sed -i \
+              -e 's|https\?://deb.debian.org/|http://mirrors.aliyun.com/|g' \
+              -e 's|https\?://security.debian.org/|http://mirrors.aliyun.com/|g' \
+              "$kb_apt_source"; \
+          fi; \
+        done ;; \
+      official) ;; \
+      *) printf 'Unsupported KB_APT_MIRROR: %s\n' "$KB_APT_MIRROR" >&2; exit 1 ;; \
+    esac \
+    && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o APT::Update::Error-Mode=any update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --no-install-recommends -y ca-certificates curl libsqlite3-0 ffmpeg poppler-utils python3 python3-venv fonts-droid-fallback fonts-noto-cjk fonts-liberation \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 knowledge \
     && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /var/lib/knowledge-service knowledge \
@@ -64,8 +82,12 @@ RUN apt-get update \
     && chown -R knowledge:knowledge /var/lib/knowledge-service
 
 COPY processing/requirements.txt /opt/knowledge-processing/requirements.txt
-RUN python3 -m venv /opt/knowledge-python \
-    && /opt/knowledge-python/bin/python3 -m pip install --no-cache-dir -r /opt/knowledge-processing/requirements.txt
+ARG KB_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN --mount=type=cache,id=course-knowledge-pip,target=/root/.cache/pip,sharing=locked \
+    python3 -m venv /opt/knowledge-python \
+    && /opt/knowledge-python/bin/python3 -m pip install \
+      --index-url "$KB_PIP_INDEX_URL" --timeout 60 --retries 3 --disable-pip-version-check \
+      -r /opt/knowledge-processing/requirements.txt
 
 COPY --from=builder /out/course-kb-server /usr/local/bin/course-kb-server
 COPY --from=document-processing /usr/local/bin/node /usr/local/bin/node

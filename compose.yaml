@@ -6,6 +6,8 @@ services:
     build:
       context: ./deploy
       dockerfile: qdrant.Dockerfile
+      args:
+        KB_APT_MIRROR: ${KB_APT_MIRROR:-aliyun}
     restart: unless-stopped
     logging:
       driver: json-file
@@ -40,6 +42,8 @@ services:
       dockerfile: Dockerfile
       args:
         KB_CARGO_REGISTRY: ${KB_CARGO_REGISTRY:-rsproxy}
+        KB_APT_MIRROR: ${KB_APT_MIRROR:-aliyun}
+        KB_PIP_INDEX_URL: ${KB_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
