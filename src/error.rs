@@ -11,6 +11,7 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -19,7 +20,12 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            details: None,
         }
+    }
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
@@ -70,6 +76,8 @@ impl IntoResponse for ApiError {
             code: &'static str,
             message: String,
             request_id: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            details: Option<serde_json::Value>,
         }
         (
             self.status,
@@ -77,6 +85,7 @@ impl IntoResponse for ApiError {
                 code: self.code,
                 message: self.message,
                 request_id: Uuid::new_v4().to_string(),
+                details: self.details,
             }),
         )
             .into_response()

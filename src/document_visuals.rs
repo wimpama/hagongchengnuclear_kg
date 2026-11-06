@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, time::timeout};
 use uuid::Uuid;
 
@@ -26,9 +26,23 @@ static RENDERER: OnceLock<Semaphore> = OnceLock::new();
 pub struct PreparedDocument {
     pub pages: Vec<ExtractedPage>,
     pub message: String,
+    pub external_resources: Option<ExternalResources>,
     keys: Vec<String>,
     storage: BlobStore,
     retained: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalResources {
+    pub count: usize,
+    pub pages: Vec<usize>,
+    pub kinds: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct PrepareOptions {
+    pub skip_external_resources: bool,
 }
 
 impl PreparedDocument {
@@ -79,10 +93,20 @@ impl Drop for Workspace {
 
 /// PDF/PPTX never silently fall back to text-only extraction. DOCX uses the
 /// bounded OOXML parser, including Word OMML formulas converted to LaTeX.
+#[cfg(test)]
 pub async fn prepare(
     storage: &BlobStore,
     key: &str,
     mime: &str,
+) -> Result<PreparedDocument, ApiError> {
+    prepare_with_options(storage, key, mime, PrepareOptions::default()).await
+}
+
+pub async fn prepare_with_options(
+    storage: &BlobStore,
+    key: &str,
+    mime: &str,
+    options: PrepareOptions,
 ) -> Result<PreparedDocument, ApiError> {
     if key.contains(['/', '\\']) || key.starts_with('.') {
         return Err(ApiError::bad_request("无效的资料存储键"));
@@ -90,6 +114,7 @@ pub async fn prepare(
     let mut document = PreparedDocument {
         pages: vec![],
         message: String::new(),
+        external_resources: None,
         keys: vec![],
         storage: storage.clone(),
         retained: false,
@@ -126,17 +151,91 @@ pub async fn prepare(
                     "PPTX 图文解析需要 Python 3，请配置 KB_PYTHON_BIN",
                 ));
             }
-            prepare_presentation(&source, &workspace.0, &mut document).await
+            let sanitized = workspace.0.join("without-external.pptx");
+            let report =
+                inspect_external(&source, &sanitized, options.skip_external_resources).await?;
+            let render_source = if report.count > 0 {
+                if !options.skip_external_resources {
+                    return Err(ApiError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "external_resources_confirmation_required",
+                        format!(
+                            "检测到 {} 个外部资源，需要确认是否跳过后继续导入",
+                            report.count
+                        ),
+                    )
+                    .with_details(serde_json::json!({"externalResources": report})));
+                }
+                document.external_resources = Some(report);
+                sanitized.as_path()
+            } else {
+                source.as_path()
+            };
+            prepare_presentation(render_source, &workspace.0, &mut document).await
         }
     })
     .await
     .map_err(|_| ApiError::unavailable("资料图文解析超时，请拆分为较小文件后重试"))?;
     result?;
     document.message = format!(
-        "已提取 {} 页正文及页面图片，支持图文联合索引；请核对公式、单位、图表和专业术语后审核。扫描页保留原图，不会自动补写正文。",
+        "已提取 {} 页正文及页面图片，支持图文联合索引；请核对公式、单位、图表和专业术语后审核。",
         document.pages.len()
     );
+    let scanned = document
+        .pages
+        .iter()
+        .filter(|p| p.text.trim().is_empty() && p.image_key.is_some())
+        .count();
+    if mime == "application/pdf" && scanned > 0 {
+        document.message.push_str(&format!(
+            " 其中 {scanned} 页没有文字层，将在后台复用当前图片理解模型生成识别初稿。"
+        ));
+    }
+    if let Some(report) = &document.external_resources {
+        document.message.push_str(&format!(
+            " 已按确认跳过 {} 个外部资源，涉及第 {} 页；课件原件保留。",
+            report.count,
+            report
+                .pages
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
     Ok(document)
+}
+
+async fn inspect_external(
+    source: &Path,
+    output: &Path,
+    skip: bool,
+) -> Result<ExternalResources, ApiError> {
+    let mut command = crate::extract::python_command();
+    command
+        .args(["-I", "-c", include_str!("../processing/pptx_external.py")])
+        .arg(source)
+        .arg(output)
+        .arg(if skip { "skip" } else { "inspect" });
+    let bytes = run_required(
+        &mut command,
+        "PPTX 外部资源检测器（Python 3）",
+        MAX_OUTPUT,
+        45,
+    )
+    .await?;
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Report {
+        external_resources: Option<ExternalResources>,
+        error: Option<String>,
+    }
+    let result: Report = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::bad_request("PPTX 外部资源检测结果无效"))?;
+    if let Some(error) = result.error {
+        return Err(ApiError::bad_request(error));
+    }
+    result.external_resources.ok_or_else(ApiError::internal)
 }
 
 fn max_pages() -> Result<usize, ApiError> {

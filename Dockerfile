@@ -28,6 +28,7 @@ COPY src ./src
 COPY migrations ./migrations
 COPY processing/pdf.py ./processing/pdf.py
 COPY processing/ooxml.py ./processing/ooxml.py
+COPY processing/pptx_external.py ./processing/pptx_external.py
 COPY processing/spreadsheet.py ./processing/spreadsheet.py
 
 # Registry downloads and compiler outputs survive a failed RUN or source edit

@@ -19,7 +19,7 @@ pub struct ExtractedDocument {
     pub message: String,
 }
 
-fn python_command() -> Command {
+pub(crate) fn python_command() -> Command {
     if let Ok(path) = std::env::var("KB_PYTHON_BIN") {
         return Command::new(path);
     }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate'
 import { Resvg } from '@resvg/resvg-js'
 import { renderPptx } from './pptx.mjs'
@@ -44,5 +45,44 @@ test('unsupported Office math is explicitly rejected instead of silently dropped
     const source = path.join(root, 'math.pptx')
     await writeFile(source, zipSync(zip))
     await assert.rejects(renderPptx(source, path.join(root, 'pages')), /数学公式/)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('navigation hyperlinks render, real linked pictures require detection and explicit skipping', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'kb-pptx-external-'))
+  try {
+    const zip = unzipSync(await createFixture())
+    const slide = 'ppt/slides/slide1.xml'
+    const rels = 'ppt/slides/_rels/slide1.xml.rels'
+    // A real hyperlink paints an SVG anchor but needs no image download.
+    // Add a hyperlink run rather than depending on run-property serialization.
+    zip[slide] = strToU8(strFromU8(zip[slide]).replace('</a:p>', '<a:r><a:rPr><a:hlinkClick r:id="nav"/></a:rPr><a:t>网页链接</a:t></a:r></a:p>'))
+    zip[rels] = strToU8(strFromU8(zip[rels]).replace('</Relationships>', '<Relationship Id="nav" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/></Relationships>'))
+    const source = path.join(root, 'hyperlink.pptx')
+    await writeFile(source, zipSync(zip))
+    const result = await renderPptx(source, path.join(root, 'hyperlink-pages'))
+    assert.match(result.pages[1].text, /网页链接/)
+
+    // Add an external-only picture alongside existing embedded media.
+    zip[slide] = strToU8(strFromU8(zip[slide]).replace('</p:spTree>', '<p:pic><p:nvPicPr><p:cNvPr id="321" name="linked"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:link="externalPicture"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"/></p:spPr></p:pic></p:spTree>'))
+    zip[rels] = strToU8(strFromU8(zip[rels]).replace('</Relationships>', '<Relationship Id="externalPicture" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://unavailable.invalid/test.jpg" TargetMode="External"/></Relationships>'))
+    const linked = path.join(root, 'linked.pptx')
+    const cleaned = path.join(root, 'cleaned.pptx')
+    await writeFile(linked, zipSync(zip))
+    const python = process.env.KB_PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3')
+    const args = process.platform === 'win32' && !process.env.KB_PYTHON_BIN ? ['-3'] : []
+    const inspect = mode => {
+      const output = spawnSync(python, [...args, path.resolve('pptx_external.py'), linked, cleaned, mode], { encoding: 'utf8', windowsHide: true })
+      assert.equal(output.status, 0, output.stderr)
+      const report = JSON.parse(output.stdout)
+      assert.equal(report.error, undefined)
+      return report.externalResources
+    }
+    assert.deepEqual(inspect('inspect'), { count: 1, pages: [2], kinds: ['image'] })
+    assert.deepEqual(inspect('skip'), { count: 1, pages: [2], kinds: ['image'] })
+    const sanitized = await renderPptx(cleaned, path.join(root, 'clean-pages'))
+    assert.equal(sanitized.pages.length, 3)
+    assert.match(sanitized.pages[1].text, /核反应截面/)
+    assert.ok((await readFile(path.join(root, 'clean-pages', '2.png'))).length > 1000)
   } finally { await rm(root, { recursive: true, force: true }) }
 })

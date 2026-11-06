@@ -6,6 +6,7 @@ mod chat_intent;
 mod config;
 mod courseware;
 mod db;
+mod document_ocr;
 mod document_visuals;
 mod embedding;
 mod error;
@@ -154,6 +155,7 @@ async fn build_tenant(config: AppConfig) -> anyhow::Result<Router> {
         .await
         .map_err(|_| anyhow::anyhow!("build lexical index"))?;
     indexing::resume_jobs(state.clone()).await;
+    document_ocr::start(state.clone());
     question_attachments::start_cleanup(state.clone());
     learning::start(state.clone());
     storage::start_cache_cleanup(state.storage.clone());
@@ -161,6 +163,7 @@ async fn build_tenant(config: AppConfig) -> anyhow::Result<Router> {
     let app = Router::new()
         .merge(routes::health_router())
         .merge(ingest::router())
+        .merge(document_ocr::router())
         .merge(courseware::router())
         .merge(models::router())
         .merge(knowledge::router())

@@ -237,6 +237,7 @@ async fn upload_asset(
     let mut description: Option<String> = None;
     let mut subtitle: Option<String> = None;
     let mut evidence_mode: Option<String> = None;
+    let mut skip_external_resources = false;
     let mut seen_fields = std::collections::HashSet::new();
     while let Some(mut field) = multipart
         .next_field()
@@ -246,14 +247,19 @@ async fn upload_asset(
         let field_name = field.name().map(str::to_owned).unwrap_or_default();
         if !matches!(
             field_name.as_str(),
-            "file" | "title" | "description" | "subtitle" | "evidenceMode"
+            "file"
+                | "title"
+                | "description"
+                | "subtitle"
+                | "evidenceMode"
+                | "skipExternalResources"
         ) || !seen_fields.insert(field_name.clone())
         {
             return Err(ApiError::bad_request("上传表单包含重复或未知字段"));
         }
         if matches!(
             field_name.as_str(),
-            "title" | "description" | "subtitle" | "evidenceMode"
+            "title" | "description" | "subtitle" | "evidenceMode" | "skipExternalResources"
         ) {
             if field.file_name().is_some() {
                 return Err(ApiError::bad_request("标题、说明和字幕应以 UTF-8 文本提交"));
@@ -291,6 +297,17 @@ async fn upload_asset(
                 "description" => description = Some(value),
                 "subtitle" => subtitle = Some(value),
                 "evidenceMode" => evidence_mode = Some(value),
+                "skipExternalResources" => {
+                    skip_external_resources = match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(ApiError::bad_request(
+                                "skipExternalResources 必须为 true 或 false",
+                            ))
+                        }
+                    }
+                }
                 _ => unreachable!(),
             }
             continue;
@@ -385,6 +402,7 @@ async fn upload_asset(
             description,
             subtitle,
             evidence_mode,
+            skip_external_resources,
         },
         None,
     )
@@ -400,6 +418,8 @@ struct CoursewareImportRequest {
     description: Option<String>,
     subtitle: Option<String>,
     evidence_mode: Option<String>,
+    #[serde(default)]
+    skip_external_resources: bool,
 }
 
 async fn import_courseware(
@@ -414,6 +434,7 @@ async fn import_courseware(
         description: request.description,
         subtitle: request.subtitle,
         evidence_mode: request.evidence_mode,
+        skip_external_resources: request.skip_external_resources,
     }
     .normalized()?;
     let source =
@@ -519,6 +540,7 @@ struct UploadFields {
     description: Option<String>,
     subtitle: Option<String>,
     evidence_mode: Option<String>,
+    skip_external_resources: bool,
 }
 
 impl UploadFields {
@@ -538,6 +560,7 @@ impl UploadFields {
             description: field(self.description, MAX_TEXT_BYTES)?,
             subtitle: field(self.subtitle, MAX_TEXT_BYTES)?,
             evidence_mode: field(self.evidence_mode, 40)?,
+            skip_external_resources: self.skip_external_resources,
         })
     }
 }
@@ -555,6 +578,7 @@ async fn finish_asset(
         description,
         subtitle,
         evidence_mode,
+        skip_external_resources,
     } = fields.normalized()?;
     let spreadsheet = stored.kind == "spreadsheet";
     let evidence_mode =
@@ -631,9 +655,15 @@ async fn finish_asset(
         document_message = parsed.message;
         parsed.pages
     } else if stored.kind == "document" {
-        let mut parsed =
-            crate::document_visuals::prepare(&state.storage, &stored.storage_key, &stored.mime)
-                .await?;
+        let mut parsed = crate::document_visuals::prepare_with_options(
+            &state.storage,
+            &stored.storage_key,
+            &stored.mime,
+            crate::document_visuals::PrepareOptions {
+                skip_external_resources,
+            },
+        )
+        .await?;
         document_message = parsed.message.clone();
         let pages = std::mem::take(&mut parsed.pages);
         prepared_document = Some(parsed);
@@ -695,6 +725,12 @@ async fn finish_asset(
         extraction["pageCount"] = json!(extracted.len());
         extraction["visualPageCount"] = json!(visual_pages);
     }
+    if let Some(report) = prepared_document
+        .as_ref()
+        .and_then(|d| d.external_resources.as_ref())
+    {
+        extraction["skippedExternalResources"] = json!(report);
+    }
     if let Some(id) = source_courseware_id.as_deref() {
         extraction["sourceCoursewareId"] = json!(id);
         extraction["sourceType"] = json!("courseware_snapshot");
@@ -735,6 +771,11 @@ async fn finish_asset(
         } else {
             mark_spreadsheet_parts(&mut tx, &revision_id, &stored.storage_key, false).await?;
         }
+    }
+    // Durable background OCR: upload completes without waiting for model calls.
+    // Only empty PDF page text is eligible; native text and DOCX math stay intact.
+    if stored.mime == "application/pdf" {
+        crate::document_ocr::queue_in_transaction(&mut tx, &asset_id, &revision_id).await?;
     }
     audit(
         &mut tx,
@@ -1082,7 +1123,7 @@ async fn insert_revision(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn insert_part(
+pub(crate) async fn insert_part(
     tx: &mut Transaction<'_, Sqlite>,
     revision: &str,
     index: usize,
@@ -1128,6 +1169,7 @@ pub struct PartView {
     pub modality: String,
     pub page: Option<i64>,
     pub has_page_image: bool,
+    pub ocr: Option<Value>,
     pub start_seconds: Option<f64>,
     pub end_seconds: Option<f64>,
     pub evidence_status: String,
@@ -1355,6 +1397,10 @@ fn part_from_row(row: &sqlx::sqlite::SqliteRow) -> PartView {
             .unwrap_or_default(),
         modality: row.get("modality"),
         page: row.get("page_number"),
+        ocr: row
+            .get::<Option<String>, _>("metadata_json")
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.get("ocr").cloned()),
         has_page_image: row
             .get::<Option<String>, _>("metadata_json")
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
@@ -1772,7 +1818,12 @@ async fn next_revision(
     expected_revision: Option<&str>,
     actor: &str,
 ) -> Result<(String, i64), ApiError> {
-    let row = sqlx::query("SELECT r.revision_id,r.source_sha256,r.revision_number FROM kb_asset_revisions r JOIN kb_assets a ON a.asset_id=r.asset_id JOIN kb_course_nodes n ON n.node_id=a.node_id WHERE r.asset_id=? AND a.deleted_at IS NULL AND n.level=2 AND n.is_active=1 ORDER BY revision_number DESC LIMIT 1").bind(asset).fetch_optional(&mut **tx).await?.ok_or_else(||ApiError::not_found("资料已失效"))?;
+    let row = sqlx::query("SELECT r.revision_id,r.source_sha256,r.revision_number,r.extraction_json FROM kb_asset_revisions r JOIN kb_assets a ON a.asset_id=r.asset_id JOIN kb_course_nodes n ON n.node_id=a.node_id WHERE r.asset_id=? AND a.deleted_at IS NULL AND n.level=2 AND n.is_active=1 ORDER BY revision_number DESC LIMIT 1").bind(asset).fetch_optional(&mut **tx).await?.ok_or_else(||ApiError::not_found("资料已失效"))?;
+    let extraction: Value = row
+        .get::<Option<String>, _>("extraction_json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(json!({}));
+    crate::document_ocr::ensure_idle(&extraction)?;
     if expected_revision != Some(row.get::<String, _>("revision_id").as_str()) {
         return Err(ApiError::bad_request("资料已更新，请刷新后重试"));
     }
@@ -1863,7 +1914,7 @@ async fn delete_asset(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn audit(
+pub(crate) async fn audit(
     tx: &mut Transaction<'_, Sqlite>,
     actor: &str,
     action: &str,

@@ -89,6 +89,10 @@ async fn review_asset(
         )
     })?;
     let rev = latest_revision(&state.db, &asset).await?;
+    let source = ingest::load_asset(&state.db, &asset).await?;
+    if let Some(extraction) = source.extraction.as_ref() {
+        crate::document_ocr::ensure_idle(extraction)?;
+    }
     let current = revision(&state.db, &rev).await?;
     if current.review == "approved" {
         return Ok(Json(ingest::load_asset(&state.db, &asset).await?));

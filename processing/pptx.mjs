@@ -39,7 +39,9 @@ export function checkedSlideSvg(pres, slide, page, measureText) {
   if (fallbacks.length) {
     throw new DocumentError(`第 ${page} 页存在暂不支持的图形（${fallbacks.join('、')}），请先导出为 PDF 后导入；未忽略这些图形`)
   }
-  if (/(?:href|xlink:href)=["'](?!data:|#)[^"']+/i.test(svg)) {
+  // Navigation links are painted as ordinary text by resvg. They are not
+  // image dependencies and must not reject an otherwise self-contained deck.
+  if (/<(?:image|use)\b[^>]*\b(?:href|xlink:href)=["'](?!data:|#)[^"']+/i.test(svg)) {
     throw new DocumentError(`第 ${page} 页含外部图片引用，请将图片嵌入课件后重试`)
   }
   return svg
