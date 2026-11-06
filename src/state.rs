@@ -19,6 +19,7 @@ pub struct AppState {
     pub qdrant: QdrantAdapter,
     pub auth: AuthUpstream,
     pub storage: BlobStore,
+    pub import_progress: Arc<crate::import_progress::ImportProgressRegistry>,
 }
 
 impl AppState {
@@ -41,6 +42,7 @@ impl AppState {
             qdrant,
             auth,
             storage,
+            import_progress: Arc::default(),
         }
     }
 }

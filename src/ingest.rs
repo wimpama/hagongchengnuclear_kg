@@ -6,7 +6,7 @@ use std::env;
 use std::path::{Path as FsPath, PathBuf};
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, patch, post},
     Json, Router,
@@ -18,7 +18,12 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{auth::require_admin, error::ApiError, state::AppState};
+use crate::{
+    auth::require_admin,
+    error::ApiError,
+    import_progress::{ImportReporter, ProgressQuery},
+    state::AppState,
+};
 
 const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -38,6 +43,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/kb-api/v1/admin/nodes/{node_id}/knowledge/import-courseware",
             post(import_courseware),
+        )
+        .route(
+            "/kb-api/v1/admin/knowledge/import-progress/{progress_id}",
+            get(get_import_progress),
         )
         .route(
             "/kb-api/v1/admin/knowledge/assets/{asset_id}",
@@ -224,10 +233,35 @@ async fn upload_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(node_id): Path<String>,
-    mut multipart: Multipart,
+    Query(query): Query<ProgressQuery>,
+    multipart: Multipart,
 ) -> Result<(StatusCode, Json<AssetView>), ApiError> {
     let user = require_admin(&state, &headers).await?;
     require_active_leaf(&state.db, &node_id).await?;
+    let progress = state
+        .import_progress
+        .begin(query.progress_id, &user.id, &node_id)?;
+    let result = receive_upload(&state, &user, &node_id, &progress, multipart).await;
+    progress.finish(&result);
+    result.map(|asset| (StatusCode::CREATED, Json(asset)))
+}
+
+async fn get_import_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crate::import_progress::ImportProgress>, ApiError> {
+    let user = require_admin(&state, &headers).await?;
+    Ok(Json(state.import_progress.get(id, &user.id)?))
+}
+
+async fn receive_upload(
+    state: &AppState,
+    user: &crate::auth::AuthenticatedUser,
+    node_id: &str,
+    progress: &ImportReporter,
+    mut multipart: Multipart,
+) -> Result<AssetView, ApiError> {
     let root = state.storage.local_dir().to_owned();
     tokio::fs::create_dir_all(&root)
         .await
@@ -382,6 +416,13 @@ async fn upload_asset(
             file.write_all(&chunk)
                 .await
                 .map_err(|_| ApiError::internal())?;
+            progress.stage(
+                "receiving",
+                "正在接收上传文件",
+                stored.size as u64,
+                None,
+                "bytes",
+            );
         }
         file.flush().await.map_err(|_| ApiError::internal())?;
         drop(file);
@@ -405,9 +446,10 @@ async fn upload_asset(
             skip_external_resources,
         },
         None,
+        progress,
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(asset)))
+    Ok(asset)
 }
 
 #[derive(Deserialize)]
@@ -426,9 +468,28 @@ async fn import_courseware(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(node_id): Path<String>,
+    Query(query): Query<ProgressQuery>,
     Json(request): Json<CoursewareImportRequest>,
 ) -> Result<(StatusCode, Json<AssetView>), ApiError> {
     let user = require_admin(&state, &headers).await?;
+    require_active_leaf(&state.db, &node_id).await?;
+    let progress = state
+        .import_progress
+        .begin(query.progress_id, &user.id, &node_id)?;
+    let result = receive_courseware(&state, &headers, &user, &node_id, &progress, request).await;
+    progress.finish(&result);
+    result.map(|asset| (StatusCode::CREATED, Json(asset)))
+}
+
+async fn receive_courseware(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &crate::auth::AuthenticatedUser,
+    node_id: &str,
+    progress: &ImportReporter,
+    request: CoursewareImportRequest,
+) -> Result<AssetView, ApiError> {
+    progress.stage("fetching", "正在读取课件原件", 0, None, "bytes");
     let fields = UploadFields {
         title: request.title,
         description: request.description,
@@ -485,6 +546,7 @@ async fn import_courseware(
     {
         return Err(ApiError::bad_request("课件超过该格式的导入大小限制"));
     }
+    let content_length = response.content_length();
     let supplied_mime = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -523,6 +585,13 @@ async fn import_courseware(
         file.write_all(&chunk)
             .await
             .map_err(|_| ApiError::internal())?;
+        progress.stage(
+            "fetching",
+            "正在读取课件原件",
+            stored.size as u64,
+            content_length,
+            "bytes",
+        );
     }
     file.flush().await.map_err(|_| ApiError::internal())?;
     drop(file);
@@ -530,8 +599,16 @@ async fn import_courseware(
         return Err(ApiError::bad_request("课件为空或实际内容与文件格式不符"));
     }
     stored.hash = format!("{:x}", digest.finalize());
-    let asset = finish_asset(&state, &user, &node_id, stored, fields, Some(source.id)).await?;
-    Ok((StatusCode::CREATED, Json(asset)))
+    finish_asset(
+        state,
+        user,
+        node_id,
+        stored,
+        fields,
+        Some(source.id),
+        progress,
+    )
+    .await
 }
 
 #[derive(Default)]
@@ -572,7 +649,9 @@ async fn finish_asset(
     mut stored: StoredFile,
     fields: UploadFields,
     source_courseware_id: Option<String>,
+    progress: &ImportReporter,
 ) -> Result<AssetView, ApiError> {
+    progress.stage("checking", "正在校验格式并解析资料", 0, None, "pages");
     let UploadFields {
         title,
         description,
@@ -661,6 +740,7 @@ async fn finish_asset(
             &stored.mime,
             crate::document_visuals::PrepareOptions {
                 skip_external_resources,
+                progress: Some(progress),
             },
         )
         .await?;
@@ -685,10 +765,12 @@ async fn finish_asset(
     // before publishing metadata so every newly accepted course resource has
     // a durable object even when the process is later replaced.
     stored.remote_started = true;
+    progress.stage("saving_original", "正在保存原件至 OSS", 0, None, "bytes");
     state
         .storage
         .put_file(&stored.storage_key, &stored.path, &stored.mime)
         .await?;
+    progress.stage("committing", "正在保存知识片段和入库记录", 0, None, "pages");
     let mut tx = state.db.begin().await?;
     let valid: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM kb_course_nodes WHERE node_id=? AND level=2 AND is_active=1",

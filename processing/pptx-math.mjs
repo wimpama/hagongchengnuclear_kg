@@ -258,7 +258,7 @@ function flattenMathAlternates(document) {
   }
 }
 
-function slidePageNumbers(parts) {
+export function slidePageNumbers(parts) {
   const presentation = parts['ppt/presentation.xml']
   const relationships = parts['ppt/_rels/presentation.xml.rels']
   const pages = new Map()

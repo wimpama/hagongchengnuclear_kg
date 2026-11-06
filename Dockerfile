@@ -47,7 +47,7 @@ COPY processing/package.json processing/package-lock.json ./
 RUN --mount=type=cache,id=course-knowledge-npm,target=/root/.npm,sharing=locked \
     npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
       --fetch-timeout=120000 --fetch-retries=3
-COPY processing/pptx.mjs processing/pptx-math.mjs ./
+COPY processing/pptx.mjs processing/pptx-math.mjs processing/pptx-objects.mjs ./
 
 FROM debian:bookworm-slim AS runtime
 

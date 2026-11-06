@@ -13,6 +13,7 @@ mod error;
 mod extract;
 mod gateway;
 mod indexing;
+mod import_progress;
 mod ingest;
 mod knowledge;
 mod learning;

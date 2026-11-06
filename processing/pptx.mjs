@@ -13,6 +13,7 @@ import {
 import {
   EquationError, preparePptxMath, equationMeasurer, paintMathSvg, restoreMathText,
 } from './pptx-math.mjs'
+import { ObjectPreviewError, preparePptxObjects, describeGraphics } from './pptx-objects.mjs'
 
 const MAX_BYTES = 100 * 1024 * 1024
 const MAX_IMAGE = 10 * 1024 * 1024
@@ -44,7 +45,8 @@ export function checkedSlideSvg(pres, slide, page, measureText, math) {
   if (math) svg = paintMathSvg(svg, math, measureText)
   const fallbacks = [...new Set([...svg.matchAll(/data-pptx-fallback=["']([^"']+)["']/g)].map(match => match[1]))]
   if (fallbacks.length) {
-    throw new DocumentError(`第 ${page} 页存在暂不支持的图形（${fallbacks.join('、')}），请先导出为 PDF 后导入；未忽略这些图形`)
+    const details = fallbacks.includes('graphicFrame') ? describeGraphics(xml) : ''
+    throw new DocumentError(`第 ${page} 页存在暂不支持的${details || `图形（${fallbacks.join('、')}）`}，缺少可用预览或当前绘图库尚不能还原，请先导出为 PDF 后导入；未忽略这些图形`)
   }
   // Navigation links are painted as ordinary text by resvg. They are not
   // image dependencies and must not reject an otherwise self-contained deck.
@@ -54,13 +56,13 @@ export function checkedSlideSvg(pres, slide, page, measureText, math) {
   return svg
 }
 
-export async function renderPptx(source, output, maxPages = 200) {
+export async function renderPptx(source, output, maxPages = 200, onProgress = () => {}) {
   const input = await readFile(source)
   if (!input.length || input.length > MAX_BYTES) throw new DocumentError('PPTX 文件为空或超过 100MB')
   let math
-  try { math = preparePptxMath(input) }
+  try { math = preparePptxMath(preparePptxObjects(input).input) }
   catch (error) {
-    if (error instanceof EquationError) throw new DocumentError(error.message)
+    if (error instanceof EquationError || error instanceof ObjectPreviewError) throw new DocumentError(error.message)
     throw error
   }
   const pres = await loadPresentation(math.input)
@@ -74,6 +76,7 @@ export async function renderPptx(source, output, maxPages = 200) {
   await mkdir(output, { recursive: true })
   const pages = []
   let total = 0
+  await onProgress({ type: 'progress', completed: 0, total: slides.length })
   for (const [index, slide] of slides.entries()) {
     const page = index + 1
     const text = restoreMathText(getSlideText(slide).trim(), math)
@@ -92,6 +95,7 @@ export async function renderPptx(source, output, maxPages = 200) {
     const imageFile = `${page}.png`
     await writeFile(path.join(output, imageFile), png)
     pages.push({ page, text, imageFile })
+    await onProgress({ type: 'progress', completed: page, total: slides.length })
   }
   return { pages }
 }
@@ -100,8 +104,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   try {
     const limit = Number(process.argv[4] || 200)
     if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new DocumentError('文档页数配置无效')
-    const result = await renderPptx(process.argv[2], process.argv[3], limit)
-    process.stdout.write(JSON.stringify(result))
+    const stream = process.argv.includes('--progress')
+    const result = await renderPptx(process.argv[2], process.argv[3], limit, stream
+      ? event => new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify(event)}\n`, error => error ? reject(error) : resolve()))
+      : undefined)
+    process.stdout.write(`${JSON.stringify(result)}${stream ? '\n' : ''}`)
   } catch (error) {
     if (error instanceof DocumentError) process.stdout.write(JSON.stringify({ error: error.message }))
     else {

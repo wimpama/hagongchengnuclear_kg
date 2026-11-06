@@ -9,12 +9,18 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    process::Command,
+    sync::Semaphore,
+    time::timeout,
+};
 use uuid::Uuid;
 
 use crate::{
     error::ApiError,
     extract::{extract_pdf, poppler_command, ExtractedPage},
+    import_progress::ImportReporter,
     storage::BlobStore,
 };
 
@@ -41,8 +47,9 @@ pub struct ExternalResources {
 }
 
 #[derive(Default)]
-pub struct PrepareOptions {
+pub struct PrepareOptions<'a> {
     pub skip_external_resources: bool,
+    pub progress: Option<&'a ImportReporter>,
 }
 
 impl PreparedDocument {
@@ -106,7 +113,7 @@ pub async fn prepare_with_options(
     storage: &BlobStore,
     key: &str,
     mime: &str,
-    options: PrepareOptions,
+    options: PrepareOptions<'_>,
 ) -> Result<PreparedDocument, ApiError> {
     if key.contains(['/', '\\']) || key.starts_with('.') {
         return Err(ApiError::bad_request("无效的资料存储键"));
@@ -127,6 +134,9 @@ pub async fn prepare_with_options(
     }
 
     // One renderer across both site tenants bounds the small server's memory.
+    if let Some(progress) = options.progress {
+        progress.stage("queued", "等待图文解析器", 0, None, "pages");
+    }
     let _permit = timeout(
         Duration::from_secs(15),
         RENDERER.get_or_init(|| Semaphore::new(1)).acquire(),
@@ -142,7 +152,7 @@ pub async fn prepare_with_options(
     );
     let result = timeout(Duration::from_secs(360), async {
         if mime == "application/pdf" {
-            prepare_pdf(&source, &mut document).await
+            prepare_pdf(&source, &mut document, options.progress).await
         } else {
             // Bound ZIP/XML expansion before the code-only slide renderer.
             let parsed = crate::extract::extract_document(storage.local_dir(), key, mime).await?;
@@ -171,7 +181,7 @@ pub async fn prepare_with_options(
             } else {
                 source.as_path()
             };
-            prepare_presentation(render_source, &workspace.0, &mut document).await
+            prepare_presentation(render_source, &workspace.0, &mut document, options.progress).await
         }
     })
     .await
@@ -265,11 +275,24 @@ fn page_count(info: &[u8], limit: usize) -> Result<usize, ApiError> {
     }
 }
 
-async fn prepare_pdf(pdf: &Path, document: &mut PreparedDocument) -> Result<(), ApiError> {
+async fn prepare_pdf(
+    pdf: &Path,
+    document: &mut PreparedDocument,
+    progress: Option<&ImportReporter>,
+) -> Result<(), ApiError> {
     let mut info = poppler_command("pdfinfo");
     info.env("LC_ALL", "C").arg(pdf);
     let info = run_required(&mut info, "pdfinfo", MAX_OUTPUT, 45).await?;
     let count = page_count(&info, max_pages()?)?;
+    if let Some(progress) = progress {
+        progress.stage(
+            "extracting",
+            "正在提取 PDF 文字",
+            0,
+            Some(count as u64),
+            "pages",
+        );
+    }
     document.pages = extract_pdf(pdf, max_pages()?).await?;
     if document.pages.len() != count {
         return Err(ApiError::bad_request(
@@ -278,6 +301,15 @@ async fn prepare_pdf(pdf: &Path, document: &mut PreparedDocument) -> Result<(), 
     }
     let mut bytes_used = 0;
     for page in &mut document.pages {
+        if let Some(progress) = progress {
+            progress.stage(
+                "rendering",
+                "正在生成并保存 PDF 页面",
+                (page.page.unwrap_or(1) - 1) as u64,
+                Some(count as u64),
+                "pages",
+            );
+        }
         let number = page.page.ok_or_else(ApiError::internal)?.to_string();
         let mut render = poppler_command("pdftoppm");
         // Omitting an output prefix writes the single JPEG to stdout. Rendering
@@ -314,6 +346,15 @@ async fn prepare_pdf(pdf: &Path, document: &mut PreparedDocument) -> Result<(), 
             .put_bytes(&key, &jpeg, "image/jpeg")
             .await?;
         page.image_key = Some(key);
+        if let Some(progress) = progress {
+            progress.stage(
+                "rendering",
+                "正在生成并保存 PDF 页面",
+                page.page.unwrap_or(0) as u64,
+                Some(count as u64),
+                "pages",
+            );
+        }
     }
     Ok(())
 }
@@ -352,7 +393,17 @@ async fn prepare_presentation(
     source: &Path,
     workspace: &Path,
     document: &mut PreparedDocument,
+    progress: Option<&ImportReporter>,
 ) -> Result<(), ApiError> {
+    if let Some(progress) = progress {
+        progress.stage(
+            "extracting",
+            "正在解析 PPTX 文字、公式和图形",
+            0,
+            None,
+            "pages",
+        );
+    }
     let processor = std::env::var_os("KB_PPTX_PROCESSOR")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("processing/pptx.mjs"));
@@ -362,8 +413,9 @@ async fn prepare_presentation(
         .arg(processor)
         .arg(source)
         .arg(workspace)
-        .arg(max_pages()?.to_string());
-    let bytes = run_required(&mut command, "PPTX 代码解析器（Node.js）", MAX_OUTPUT, 240).await?;
+        .arg(max_pages()?.to_string())
+        .arg("--progress");
+    let bytes = run_presentation(&mut command, progress, max_pages()?).await?;
     let manifest: SlideManifest = serde_json::from_slice(&bytes)
         .map_err(|_| ApiError::unavailable("PPTX 解析结果无效，请检查后端 processing 依赖"))?;
     if let Some(error) = manifest.error {
@@ -375,6 +427,16 @@ async fn prepare_presentation(
         return Err(ApiError::bad_request("PPTX 解析页数无效，请拆分资料后重试"));
     }
     let mut bytes_used = 0;
+    let page_count = manifest.pages.len() as u64;
+    if let Some(progress) = progress {
+        progress.stage(
+            "saving_pages",
+            "正在保存 PPTX 页面至 OSS",
+            0,
+            Some(page_count),
+            "pages",
+        );
+    }
     for (i, page) in manifest.pages.into_iter().enumerate() {
         if page.page != i + 1 || page.image_file != format!("{}.png", i + 1) {
             return Err(ApiError::bad_request(
@@ -410,8 +472,104 @@ async fn prepare_presentation(
         tokio::fs::remove_file(path)
             .await
             .map_err(|_| ApiError::internal())?;
+        if let Some(progress) = progress {
+            progress.stage(
+                "saving_pages",
+                "正在保存 PPTX 页面至 OSS",
+                i as u64 + 1,
+                Some(page_count),
+                "pages",
+            );
+        }
     }
     Ok(())
+}
+
+/// NDJSON is bounded across the whole subprocess, including its final manifest.
+/// Progress comes from completed page writes, never an elapsed-time estimate.
+async fn run_presentation(
+    command: &mut Command,
+    progress: Option<&ImportReporter>,
+    limit: usize,
+) -> Result<Vec<u8>, ApiError> {
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn().map_err(|_| {
+        ApiError::unavailable("无法启动 PPTX 代码解析器，请检查 Node.js 依赖和 KB_NODE_BIN")
+    })?;
+    let result = timeout(Duration::from_secs(240), async {
+        let stdout = child.stdout.take().ok_or_else(ApiError::internal)?;
+        let mut reader = BufReader::new(stdout.take(MAX_OUTPUT + 1));
+        let mut bytes_read = 0;
+        let mut manifest = None;
+        let mut completed = 0;
+        let mut total = None;
+        loop {
+            let mut line = Vec::new();
+            if reader
+                .read_until(b'\n', &mut line)
+                .await
+                .map_err(|_| ApiError::unavailable("PPTX 进度读取失败"))?
+                == 0
+            {
+                break;
+            }
+            bytes_read += line.len() as u64;
+            if bytes_read > MAX_OUTPUT {
+                return Err(ApiError::bad_request("PPTX 解析输出超过限制，请拆分资料"));
+            }
+            let event: serde_json::Value = serde_json::from_slice(&line)
+                .map_err(|_| ApiError::unavailable("PPTX 解析结果无效，请检查 processing 依赖"))?;
+            if event.get("type").and_then(|v| v.as_str()) == Some("progress") {
+                let n = event["completed"].as_u64().ok_or_else(ApiError::internal)?;
+                let count = event["total"]
+                    .as_u64()
+                    .filter(|&v| v > 0 && v <= limit as u64)
+                    .ok_or_else(ApiError::internal)?;
+                if n < completed
+                    || n > count
+                    || total.is_some_and(|v| v != count)
+                    || manifest.is_some()
+                {
+                    return Err(ApiError::unavailable("PPTX 页面进度无效"));
+                }
+                completed = n;
+                total = Some(count);
+                if let Some(progress) = progress {
+                    progress.stage("rendering", "正在生成 PPTX 页面", n, Some(count), "pages");
+                }
+            } else if manifest.replace(line).is_some() {
+                return Err(ApiError::unavailable("PPTX 重复返回解析结果"));
+            }
+        }
+        if !child
+            .wait()
+            .await
+            .map_err(|_| ApiError::internal())?
+            .success()
+        {
+            return Err(ApiError::bad_request(
+                "PPTX 解析进程中断，请检查文件或拆分后重试",
+            ));
+        }
+        manifest.ok_or_else(|| ApiError::unavailable("PPTX 未返回解析结果"))
+    })
+    .await;
+    match result {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(ApiError::unavailable("PPTX 解析超时，请拆分资料后重试"))
+        }
+    }
 }
 
 pub(crate) fn page_image_mime(key: &str) -> &'static str {
@@ -562,10 +720,20 @@ mod tests {
         run_required(&mut fixture, "PPTX test fixture", MAX_OUTPUT, 30)
             .await
             .unwrap();
-        let mut document = prepare(
+        let registry =
+            std::sync::Arc::new(crate::import_progress::ImportProgressRegistry::default());
+        let progress_id = Uuid::new_v4();
+        let progress = registry
+            .begin(Some(progress_id), "teacher", "node")
+            .unwrap();
+        let mut document = prepare_with_options(
             &storage,
             &key,
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            PrepareOptions {
+                progress: Some(&progress),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -574,6 +742,14 @@ mod tests {
         assert!(document.pages[0].text.is_empty());
         assert!(document.pages[1].text.contains("核反应截面"));
         assert!(document.pages[2].text.contains("CHART PAGE"));
+        let observed = serde_json::to_value(registry.get(progress_id, "teacher").unwrap()).unwrap();
+        assert_eq!(observed["stage"], "saving_pages");
+        assert_eq!(observed["completed"], 3);
+        assert_eq!(observed["total"], 3);
+        assert_eq!(
+            observed["state"], "running",
+            "page rendering is not an import commit"
+        );
         for page in &document.pages {
             let key = page.image_key.as_ref().unwrap();
             assert!(key.ends_with(".png"));
@@ -589,6 +765,31 @@ mod tests {
         document.retain();
         drop(document);
         assert!(images.iter().all(|key| workspace.0.join(key).exists()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Node.js for actual subprocess output bounds and ordering"]
+    async fn pptx_progress_stream_rejects_regression_changed_totals_and_excess_output() {
+        for events in [
+            serde_json::json!([{"type":"progress","completed":2,"total":3},{"type":"progress","completed":1,"total":3}]),
+            serde_json::json!([{"type":"progress","completed":1,"total":3},{"type":"progress","completed":2,"total":4}]),
+            serde_json::json!([{"pages":[]},{"pages":[]}]),
+        ] {
+            let mut command =
+                Command::new(std::env::var("KB_NODE_BIN").unwrap_or_else(|_| "node".into()));
+            command.arg("-e").arg(format!(
+                "for(const event of {events}) process.stdout.write(JSON.stringify(event)+'\\n')"
+            ));
+            assert!(run_presentation(&mut command, None, 200).await.is_err());
+        }
+        let mut command =
+            Command::new(std::env::var("KB_NODE_BIN").unwrap_or_else(|_| "node".into()));
+        command.arg("-e").arg(format!(
+            "process.stdout.write('x'.repeat({}))",
+            MAX_OUTPUT + 1
+        ));
+        let error = run_presentation(&mut command, None, 200).await.unwrap_err();
+        assert!(error.message.contains("超过限制"));
     }
 
     #[tokio::test]
