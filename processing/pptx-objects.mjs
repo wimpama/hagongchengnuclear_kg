@@ -4,6 +4,7 @@ import { DOMParser, XMLSerializer } from '@xmldom/xmldom'
 import { unzipSync, zipSync, strFromU8, strToU8 } from 'fflate'
 import { posix } from 'node:path'
 import { slidePageNumbers } from './pptx-math.mjs'
+import { prepareMetafileImages } from './pptx-metafiles.mjs'
 
 const P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 const A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
@@ -56,7 +57,7 @@ function flattenAlternates(document) {
   }
 }
 
-export function preparePptxObjects(input) {
+export async function preparePptxObjects(input, options) {
   let expanded = 0, entries = 0
   const parts = unzipSync(input, { filter(entry) {
     expanded += entry.originalSize
@@ -75,7 +76,10 @@ export function preparePptxObjects(input) {
       const relPath = posix.join(posix.dirname(part), '_rels', `${posix.basename(part)}.rels`)
       const rels = parts[relPath] ? all(parse(strFromU8(parts[relPath])), PKG_R, 'Relationship') : []
       for (const frame of all(document, P, 'graphicFrame')) {
-        const object = all(frame, P, 'oleObj')[0]
+        // PowerPoint/MathType may put the preview only in mc:Fallback below
+        // graphicData; mc:Choice is the VML/OLE representation without p:pic.
+        const objects = all(frame, P, 'oleObj')
+        const object = objects.find(node => all(node, P, 'pic').length) || objects[0]
         if (!object) continue // Native charts and tables continue through the renderer.
         const label = `${kind(frame)}${name(frame)}`
         const picture = all(object, P, 'pic')[0]
@@ -115,5 +119,6 @@ export function preparePptxObjects(input) {
     const patched = serializer.serializeToString(document)
     if (patched !== xml) { parts[part] = strToU8(patched); changed = true }
   }
-  return { input: changed ? zipSync(parts) : input, recovered }
+  const converted = await prepareMetafileImages(parts, pages, options)
+  return { input: changed || converted ? zipSync(parts) : input, recovered, converted }
 }

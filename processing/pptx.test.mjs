@@ -9,13 +9,16 @@ import { Resvg } from '@resvg/resvg-js'
 import { renderPptx } from './pptx.mjs'
 import { createFixture } from './pptx-fixture.mjs'
 import { preparePptxObjects } from './pptx-objects.mjs'
+import { metafileSvg, metafilePng } from './pptx-metafiles.mjs'
 
-async function oleFixture({ preview = true, fallback = false, icon = false } = {}) {
+async function oleFixture({ preview = true, fallback = false, nested = false, icon = false } = {}) {
   const archive = unzipSync(await createFixture())
   const name = 'ppt/slides/slide3.xml' // First display page, despite the part name.
   const xml = strFromU8(archive[name])
   const picture = xml.match(/<p:pic\b[\s\S]*?<\/p:pic>/)[0]
-  const frame = `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="89" name="散射方程预览"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm rot="0"><a:off x="914400" y="914400"/><a:ext cx="7315200" cy="3657600"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole"><p:oleObj progId="Equation.3" showAsIcon="${icon ? 1 : 0}"><p:embed/>${preview ? picture : ''}</p:oleObj></a:graphicData></a:graphic></p:graphicFrame>`
+  const object = `<p:oleObj progId="Equation.DSMT4" showAsIcon="${icon ? 1 : 0}"><p:embed/>${preview ? picture : ''}</p:oleObj>`
+  const content = nested ? `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="v"><p:oleObj progId="Equation.DSMT4"><p:embed/></p:oleObj></mc:Choice><mc:Fallback>${object}</mc:Fallback></mc:AlternateContent>` : object
+  const frame = `<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="89" name="散射方程预览"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm rot="0"><a:off x="914400" y="914400"/><a:ext cx="7315200" cy="3657600"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole">${content}</a:graphicData></a:graphic></p:graphicFrame>`
   archive[name] = strToU8(xml.replace(picture, fallback
     ? `<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="p">${frame}</mc:Choice><mc:Fallback>${picture}</mc:Fallback></mc:AlternateContent>` : frame))
   return zipSync(archive)
@@ -24,9 +27,9 @@ async function oleFixture({ preview = true, fallback = false, icon = false } = {
 test('OLE uses the saved picture at its frame bounds; compatibility fallback and real page progress are preserved', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'kb-pptx-ole-'))
   try {
-    for (const fallback of [false, true]) {
+    for (const fallback of [false, true, 'nested']) {
       const source = path.join(root, `ole-${fallback}.pptx`)
-      const original = await oleFixture({ fallback })
+      const original = await oleFixture({ fallback: fallback === true, nested: fallback === 'nested' })
       await writeFile(source, original)
       const events = []
       const { pages } = await renderPptx(source, path.join(root, `pages-${fallback}`), 200, event => events.push(event))
@@ -48,6 +51,85 @@ test('OLE uses the saved picture at its frame bounds; compatibility fallback and
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+// A small original WMF fixture, with the same legacy Symbol charset and
+// EXTTEXTOUT spacing as MathType. No teacher's course material is checked in.
+function mathTypeWmf() {
+  const i16 = (...values) => { const b = Buffer.alloc(values.length * 2); values.forEach((v, i) => b.writeInt16LE(v, i * 2)); return b }
+  const records = []
+  const record = (fn, data = Buffer.alloc(0)) => {
+    const b = Buffer.alloc(6 + data.length + data.length % 2)
+    b.writeUInt32LE(b.length / 2); b.writeUInt16LE(fn, 4); data.copy(b, 6); records.push(b)
+  }
+  record(0x20b, i16(0, 0)); record(0x20c, i16(200, 800))
+  record(0x12e, i16(25)); record(0x102, i16(1))
+  const font = Buffer.alloc(50)
+  font.writeInt16LE(-100); font.writeInt16LE(400, 8); font[13] = 1; font[17] = 16
+  font.write('Symbol', 18, 'ascii')
+  record(0x2fb, font); record(0x12d, i16(0)); record(0x214, i16(130, 50))
+  // γ → σ: arrows are single Symbol bytes, never a GBK character pair.
+  record(0xa32, Buffer.concat([i16(0, 0, 3, 0), Buffer.from([0x67, 0xae, 0x73, 0]), i16(180, 180, 180)]))
+  for (const [code, y] of [[0xec, 70], [0xed, 120], [0xee, 170]]) {
+    record(0x214, i16(y, 650)); record(0xa32, Buffer.concat([i16(0, 0, 1, 0), Buffer.from([code, 0])]))
+  }
+  record(0)
+  const header = Buffer.alloc(18)
+  header.writeUInt16LE(1); header.writeUInt16LE(9, 2); header.writeUInt16LE(0x300, 4)
+  header.writeUInt32LE((18 + records.reduce((sum, r) => sum + r.length, 0)) / 2, 6)
+  header.writeUInt16LE(16, 10); header.writeUInt32LE(Math.max(...records.map(r => r.length / 2)), 12)
+  return Buffer.concat([header, ...records])
+}
+
+test('legacy MathType WMF preserves Greek symbols, single-byte arrows, bracket pieces and explicit glyph spacing', async () => {
+  const source = mathTypeWmf()
+  const original = Buffer.from(source)
+  const svg = await metafileSvg(source)
+  assert.match(svg, />γ<\/text>/)
+  assert.match(svg, />→<\/text>/)
+  assert.match(svg, />σ<\/text>/)
+  for (const part of ['⎧', '⎨', '⎩']) assert.ok(svg.includes(part), `missing bracket piece ${part}`)
+  assert.ok(!svg.includes('�'))
+  const positions = [...svg.matchAll(/<text x="([\d.]+)"[^>]*>([γ→σ])<\/text>/g)].map(m => Number(m[1]))
+  assert.equal(positions.length, 3)
+  assert.ok(Math.abs(positions[1] - positions[0] - (positions[2] - positions[1])) < 1, 'WMF glyph dx was lost')
+  const png = await metafilePng(source)
+  assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
+  assert.ok(png.length > 1000)
+  assert.deepEqual(source, original)
+  await assert.rejects(metafilePng(source.subarray(0, -6)), /记录不完整/)
+  await assert.rejects(metafilePng(Buffer.alloc(10)), /损坏/)
+})
+
+test('nested MathType fallback with WMF preview goes through the complete page-rendering path', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'kb-pptx-wmf-'))
+  try {
+    const archive = unzipSync(await oleFixture({ nested: true }))
+    archive['ppt/media/math-preview.wmf'] = mathTypeWmf()
+    const rel = 'ppt/slides/_rels/slide3.xml.rels'
+    archive[rel] = strToU8(strFromU8(archive[rel]).replace(/Target="[^\"]*\.png"/, 'Target="../media/math-preview.wmf"'))
+    // An unused stale relationship must not reject an otherwise complete deck.
+    archive[rel] = strToU8(strFromU8(archive[rel]).replace('</Relationships>', '<Relationship Id="unused" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/missing.wmf"/></Relationships>'))
+    archive['[Content_Types].xml'] = strToU8(strFromU8(archive['[Content_Types].xml']).replace('</Types>', '<Default Extension="wmf" ContentType="image/x-wmf"/></Types>'))
+    const source = zipSync(archive)
+    const prepared = await preparePptxObjects(source)
+    assert.equal(prepared.recovered, 1)
+    assert.equal(prepared.converted, 1)
+    const patched = unzipSync(prepared.input)
+    assert.equal(Buffer.from(patched['ppt/media/math-preview.wmf']).subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
+    assert.match(strFromU8(patched['[Content_Types].xml']), /PartName="\/ppt\/media\/math-preview.wmf" ContentType="image\/png"/)
+    assert.equal((await preparePptxObjects(prepared.input)).converted, 0)
+    const file = path.join(root, 'formula.pptx')
+    await writeFile(file, source)
+    const result = await renderPptx(file, path.join(root, 'pages'))
+    assert.equal(result.pages.length, 3)
+    const image = await readFile(path.join(root, 'pages', '1.png'))
+    const pixels = new Resvg(`<svg xmlns="http://www.w3.org/2000/svg" width="400" height="225"><image width="400" height="225" href="data:image/png;base64,${image.toString('base64')}"/></svg>`).render().pixels
+    let dark = 0
+    for (let i = 0; i < pixels.length; i += 4) if (pixels[i] < 60 && pixels[i+1] < 60 && pixels[i+2] < 60 && pixels[i+3] > 200) dark++
+    assert.ok(dark > 100, 'formula preview became empty')
+    assert.ok((await readFile(file)).equals(Buffer.from(source)), 'source archive changed')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('missing OLE content preview and icon-only objects fail with actual page and object name', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'kb-pptx-missing-preview-'))
   try {
@@ -59,7 +141,7 @@ test('missing OLE content preview and icon-only objects fail with actual page an
     const archive = unzipSync(await oleFixture())
     const rels = 'ppt/slides/_rels/slide3.xml.rels'
     archive[rels] = strToU8(strFromU8(archive[rels]).replace(/Target="[^\"]*\.png"/g, 'Target="https://invalid.example/preview.png" TargetMode="External"'))
-    assert.throws(() => preparePptxObjects(zipSync(archive)), /第 1 页.*预览图未嵌入或已损坏/)
+    await assert.rejects(preparePptxObjects(zipSync(archive)), /第 1 页.*预览图未嵌入或已损坏/)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

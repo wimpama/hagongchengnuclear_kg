@@ -14,6 +14,7 @@ import {
   EquationError, preparePptxMath, equationMeasurer, paintMathSvg, restoreMathText,
 } from './pptx-math.mjs'
 import { ObjectPreviewError, preparePptxObjects, describeGraphics } from './pptx-objects.mjs'
+import { MetafileError } from './pptx-metafiles.mjs'
 
 const MAX_BYTES = 100 * 1024 * 1024
 const MAX_IMAGE = 10 * 1024 * 1024
@@ -59,10 +60,11 @@ export function checkedSlideSvg(pres, slide, page, measureText, math) {
 export async function renderPptx(source, output, maxPages = 200, onProgress = () => {}) {
   const input = await readFile(source)
   if (!input.length || input.length > MAX_BYTES) throw new DocumentError('PPTX 文件为空或超过 100MB')
+  const { file, measureText: ordinaryMeasure } = fonts()
   let math
-  try { math = preparePptxMath(preparePptxObjects(input).input) }
+  try { math = preparePptxMath((await preparePptxObjects(input, { fontFile: file })).input) }
   catch (error) {
-    if (error instanceof EquationError || error instanceof ObjectPreviewError) throw new DocumentError(error.message)
+    if (error instanceof EquationError || error instanceof ObjectPreviewError || error instanceof MetafileError) throw new DocumentError(error.message)
     throw error
   }
   const pres = await loadPresentation(math.input)
@@ -71,7 +73,6 @@ export async function renderPptx(source, output, maxPages = 200, onProgress = ()
   const size = getSlideSize(pres)
   const aspect = size && size.width / size.height
   if (!Number.isFinite(aspect) || aspect < 0.2 || aspect > 5) throw new DocumentError('PPTX 幻灯片尺寸无效或超出支持范围')
-  const { file, measureText: ordinaryMeasure } = fonts()
   const measureText = equationMeasurer(math, ordinaryMeasure)
   await mkdir(output, { recursive: true })
   const pages = []
