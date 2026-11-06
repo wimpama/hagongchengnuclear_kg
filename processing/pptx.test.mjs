@@ -35,7 +35,7 @@ test('code renderer preserves real slide order, CJK text, embedded image and nat
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-test('unsupported Office math is explicitly rejected instead of silently dropped', async () => {
+test('an equation outside a slide text paragraph is explicitly rejected', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'kb-pptx-math-'))
   try {
     const zip = unzipSync(await createFixture())
@@ -44,7 +44,7 @@ test('unsupported Office math is explicitly rejected instead of silently dropped
     zip[name] = strToU8(xml)
     const source = path.join(root, 'math.pptx')
     await writeFile(source, zipSync(zip))
-    await assert.rejects(renderPptx(source, path.join(root, 'pages')), /数学公式/)
+    await assert.rejects(renderPptx(source, path.join(root, 'pages')), /公式.*文本段落/)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

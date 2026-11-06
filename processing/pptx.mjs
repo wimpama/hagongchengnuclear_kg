@@ -8,8 +8,11 @@ import {
   getSlides, getSlideSize, getSlideText, getSlideXmlString, loadPresentation,
 } from '@office-kit/pptx'
 import {
-  FONT_FILES, SANS, SERIF, MONO, buildFontkitMeasurer, renderSlideToSvg,
+  FONT_FILES, SANS, SERIF, MONO, buildFontkitMeasurer, renderSlideToSvg, substituteFamily,
 } from '@office-kit/pptx-preview/node'
+import {
+  EquationError, preparePptxMath, equationMeasurer, paintMathSvg, restoreMathText,
+} from './pptx-math.mjs'
 
 const MAX_BYTES = 100 * 1024 * 1024
 const MAX_IMAGE = 10 * 1024 * 1024
@@ -29,12 +32,16 @@ function fonts() {
   return { file, measureText: buildFontkitMeasurer({ fonts: [{ family: 'Knowledge CJK', source: file }] }) }
 }
 
-export function checkedSlideSvg(pres, slide, page, measureText) {
+export function checkedSlideSvg(pres, slide, page, measureText, math) {
   const xml = getSlideXmlString(slide)
   if (/<(?:[\w-]+:)?(?:oMath|oMathPara)\b/.test(xml)) {
     throw new DocumentError(`第 ${page} 页含当前代码绘图库不支持的 Office 数学公式，请先导出为 PDF 后导入，以保留原公式`)
   }
-  const svg = renderSlideToSvg(pres, slide, { textLayout: 'svg', measureText })
+  let svg = renderSlideToSvg(pres, slide, {
+    textLayout: 'svg', measureText,
+    resolveFamily: family => math?.find(family) ? family : substituteFamily(family),
+  })
+  if (math) svg = paintMathSvg(svg, math, measureText)
   const fallbacks = [...new Set([...svg.matchAll(/data-pptx-fallback=["']([^"']+)["']/g)].map(match => match[1]))]
   if (fallbacks.length) {
     throw new DocumentError(`第 ${page} 页存在暂不支持的图形（${fallbacks.join('、')}），请先导出为 PDF 后导入；未忽略这些图形`)
@@ -50,20 +57,32 @@ export function checkedSlideSvg(pres, slide, page, measureText) {
 export async function renderPptx(source, output, maxPages = 200) {
   const input = await readFile(source)
   if (!input.length || input.length > MAX_BYTES) throw new DocumentError('PPTX 文件为空或超过 100MB')
-  const pres = await loadPresentation(input)
+  let math
+  try { math = preparePptxMath(input) }
+  catch (error) {
+    if (error instanceof EquationError) throw new DocumentError(error.message)
+    throw error
+  }
+  const pres = await loadPresentation(math.input)
   const slides = getSlides(pres)
   if (!slides.length || slides.length > maxPages) throw new DocumentError(`PPTX 页数必须在 1 到 ${maxPages} 页之间，请拆分资料`)
   const size = getSlideSize(pres)
   const aspect = size && size.width / size.height
   if (!Number.isFinite(aspect) || aspect < 0.2 || aspect > 5) throw new DocumentError('PPTX 幻灯片尺寸无效或超出支持范围')
-  const { file, measureText } = fonts()
+  const { file, measureText: ordinaryMeasure } = fonts()
+  const measureText = equationMeasurer(math, ordinaryMeasure)
   await mkdir(output, { recursive: true })
   const pages = []
   let total = 0
   for (const [index, slide] of slides.entries()) {
     const page = index + 1
-    const text = getSlideText(slide).trim()
-    const svg = checkedSlideSvg(pres, slide, page, measureText)
+    const text = restoreMathText(getSlideText(slide).trim(), math)
+    let svg
+    try { svg = checkedSlideSvg(pres, slide, page, measureText, math) }
+    catch (error) {
+      if (error instanceof EquationError) throw new DocumentError(`第 ${page} 页${error.message}`)
+      throw error
+    }
     const png = new Resvg(svg, {
       fitTo: { mode: aspect >= 1 ? 'width' : 'height', value: 1600 },
       font: { fontFiles: [...FONT_FILES, file], loadSystemFonts: false, defaultFontFamily: SANS, sansSerifFamily: SANS, serifFamily: SERIF, monospaceFamily: MONO },
